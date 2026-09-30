@@ -67,17 +67,10 @@ fn radii_hp_and_seed_determinism() {
         assert_eq!(x.hp, y.hp);
     }
     assert!(a.elems.iter().zip(&c.elems).any(|(x, y)| x.r != y.r));
-    let (mut lo, mut hi) = (u8::MAX, 0);
     for e in &a.elems {
         assert!(e.r >= R_MIN && e.r <= R_MAX);
-        assert_eq!(e.hp, hp_for_radius(e.r));
-        lo = lo.min(e.hp);
-        hi = hi.max(e.hp);
+        assert_eq!(e.hp, ELEM_HP);
     }
-    // Bigger spheres take more hits.
-    assert!(hi > lo, "hp range {lo}..{hi}");
-    assert_eq!(hp_for_radius(R_MIN), HP_K as u8);
-    assert_eq!(hp_for_radius(R_MAX), 4 * hp_for_radius(R_MIN));
 }
 
 #[test]
@@ -122,7 +115,7 @@ fn coherent_body_settles_on_its_slots() {
     };
     settle(&mut p, &world, 2.0, walk);
     let worst = worst_slot_error(&p);
-    assert!(worst < 0.2, "walking slot error {worst}");
+    assert!(worst < 0.35, "walking slot error {worst}");
     assert!(p.feet.z > 5.0, "walked to z = {}", p.feet.z);
 }
 
@@ -144,6 +137,7 @@ fn penetration_passes_through_multiple_spheres() {
         e.r = 0.3;
         e.hp = 20;
         e.max_hp = 20;
+        e.vel = Vec3::ZERO;
     }
     let origin = v3(0.0, 1.0, 0.0);
     let dir = v3(0.0, 0.0, 1.0);
@@ -151,17 +145,48 @@ fn penetration_passes_through_multiple_spheres() {
     let ev = hitscan(&mut players, 0, origin, dir, Weapon::RIFLE, &world);
     assert_eq!(ev.len(), 1);
     assert_eq!(ev[0].elem, 0);
-    assert_eq!(players[1].elems[0].hp, 18);
+    assert_eq!(players[1].elems[0].hp, 19);
+    // The hit knocks the sphere along the shot.
+    assert!(players[1].elems[0].vel.z > 0.0);
 
     let ev = hitscan(&mut players, 0, origin, dir, Weapon::RAILGUN, &world);
     assert_eq!(ev.len(), 3); // only three spheres exist on the line
-    assert_eq!(
-        ev.iter().map(|e| e.damage).collect::<Vec<_>>(),
-        vec![6, 3, 1]
-    );
-    assert_eq!(players[1].elems[0].hp, 12);
-    assert_eq!(players[1].elems[1].hp, 17);
+    assert_eq!(players[1].elems[0].hp, 18);
+    assert_eq!(players[1].elems[1].hp, 19);
     assert_eq!(players[1].elems[2].hp, 19);
+}
+
+#[test]
+fn spheres_take_two_hits_and_regrow() {
+    let world = open_world();
+    let mut players = vec![
+        Player::spawn(1, v3(0.0, 0.0, 0.0)),
+        Player::spawn(2, v3(0.0, 0.0, 10.0)),
+    ];
+    settle(&mut players[1], &world, 0.5, idle(0.0));
+    let origin = v3(0.0, 1.4, 0.5);
+    let dir = (players[1].core.pos - origin).normalized();
+    let first = hitscan(&mut players, 0, origin, dir, Weapon::RIFLE, &world)[0];
+    assert!(!first.destroyed);
+    let e = first.elem as usize;
+    // Put the (recoiled) sphere back on the line for the second shot.
+    players[1].elems[e].pos = origin + dir * first.t;
+    let second = hitscan(&mut players, 0, origin, dir, Weapon::RIFLE, &world)[0];
+    assert_eq!(second.elem as usize, e);
+    assert!(second.destroyed);
+
+    // Wound three more: one sphere back per REGEN_TIME, destroyed first.
+    for k in 0..3 {
+        let i = (e + 1 + k) % players[1].elems.len();
+        players[1].elems[i].hp = 1;
+    }
+    let missing = |p: &Player| p.elems.iter().filter(|e| e.hp < e.max_hp).count();
+    assert_eq!(missing(&players[1]), 4);
+    settle(&mut players[1], &world, REGEN_TIME + 0.1, idle(0.0));
+    assert_eq!(missing(&players[1]), 3);
+    assert!(players[1].elems[e].alive());
+    settle(&mut players[1], &world, 3.0 * REGEN_TIME, idle(0.0));
+    assert_eq!(missing(&players[1]), 0);
 }
 
 #[test]
@@ -387,4 +412,32 @@ fn dispersal_spreads_the_flock_and_reforming_recovers() {
     let worst = worst_slot_error(&p);
     assert!(worst < 0.05, "re-formed slot error {worst}");
     assert!(p.can_act());
+}
+
+#[test]
+fn a_hit_sphere_knocks_its_neighbours() {
+    let world = open_world();
+    let mut p = Player::spawn(4, Vec3::ZERO);
+    settle(&mut p, &world, 1.0, idle(0.0));
+    // Kick the sphere nearest the chest hard towards the core.
+    let (i, _) = p
+        .elems
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (i, (e.pos - p.core.pos).len()))
+        .fold((0, f32::MAX), |b, x| if x.1 < b.1 { x } else { b });
+    let start: Vec<Vec3> = p.elems.iter().map(|e| e.pos).collect();
+    let dir = (p.core.pos - p.elems[i].pos).normalized();
+    for _ in 0..4 {
+        p.recoil(i, dir);
+    }
+    settle(&mut p, &world, 0.1, idle(0.0));
+    let moved = (0..p.elems.len())
+        .filter(|&j| j != i && (p.elems[j].pos - start[j]).len() > 0.01)
+        .count();
+    assert!(moved > 0, "no neighbour was knocked");
+    // And the body recovers.
+    settle(&mut p, &world, 2.0, idle(0.0));
+    let worst = worst_slot_error(&p);
+    assert!(worst < 0.02, "slot error after knock {worst}");
 }

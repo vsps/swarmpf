@@ -4,8 +4,9 @@
 
 Multiplayer FPS. Each player is a cloud of spheres around one small, lethal core.
 
-- **Coherent mode:** the spheres are attracted to slots on a humanoid rig (soft spring, ~0.1 m lag at walking
-  speed, `K_SLOT` / `SLOT_FOLLOW`) running a procedural walk cycle. The body moves as a capsule
+- **Coherent mode:** the spheres are attracted to slots on a humanoid rig (soft spring, ~0.26 m lag at walking
+  speed, `K_SLOT` / `SLOT_FOLLOW`). A swarm's spheres collide with each other (`collide_elements`), so a hit
+  sphere knocks its neighbours; coherent contacts only fire when two spheres are closer than their slots allow running a procedural walk cycle. The body moves as a capsule
   and can fire weapons and use things (doors are not implemented yet).
 - **Dispersed mode:** the spheres flock (boids) around the core, which is the flock leader. The player moves
   faster and fits through gaps the body cannot, but cannot act. Re-forming needs room for the body capsule.
@@ -17,14 +18,16 @@ Multiplayer FPS. Each player is a cloud of spheres around one small, lethal core
 
 - **Spheres, not cubes.** Ray-sphere is one dot product, one discriminant and a sqrt. Boid separation is
   `dist < ri + rj`. Sphere vs box collision is a clamp. Normals are free.
-- **Per-sphere health.** Radius is random in `[R_MIN, R_MAX]` from the player's seed; `hp = ceil(HP_K * (r/R_MIN)^2)`,
-  so the biggest sphere takes 4x the hits of the smallest. Big spheres sit on the outer shell of each bone, so they
-  armour the core. Radii are regenerated from the seed, never sent.
+- **Per-sphere health.** Every sphere has `ELEM_HP` = 2: each hit removes 1 whatever the weapon, and hits knock the
+  sphere along the shot (`RECOIL`, less for bigger spheres). Each player regrows one sphere every `REGEN_TIME` (3 s),
+  destroyed before damaged, innermost first; a regrown sphere appears at the core. Radius is random in
+  `[R_MIN, R_MAX]` from the player's seed (bigger sit on the outer shell) and is regenerated from the seed, never sent.
 - **Core.** One tiny sphere (`CORE_RADIUS` 0.04) buried in the chest, the flock leader when dispersed. Any hit kills.
   Its hit sphere is inflated 1.5x (`CORE_HIT_SCALE`) so it is hittable. Shots hit the nearest sphere first, so the
   intact body shields the core and damage opens lines to it.
-- **Penetration.** `Weapon.pierce` extra spheres per shot; each pierced sphere halves damage (min 1).
-  Rifle 2/0, pellet 1/0, railgun 6/3.
+- **Penetration.** `Weapon.pierce` extra spheres per shot, one hp each. Rifle pierces 0, pellet 0, railgun 3.
+- **Guns** (`WEAPONS` in `game.rs`): rifle automatic; shotgun fires 15 pellets uniformly in a 3 degree cone; railgun
+  semi-automatic. Damaged spheres show `HIT_COLOR` (red) until they regrow.
 - **Procedural humanoid, no Mixamo.** 16-joint rig generated in code; every joint only swings about X. Pose is a
   pure function of (walk phase, amplitude) so server and clients agree. 64 slots on the bones (torso is two shells
   deep); slot layout mirrors legs.
@@ -58,7 +61,9 @@ client/   wgpu renderer + local game
 - Body space is +Y up, +Z forward, +X left ("L" joints/slots are +X). `Input.strafe > 0` means right.
 - Fixed tick 60 Hz (`sim::DT`). The client accumulates real time and ticks the sim.
 - Rifle is automatic (hold LMB); pellet and railgun fire once per click (`WEAPONS` auto flag, `Game::trigger`).
-- Third-person camera pivot trails the player (`CAM_LAG_*`) and pulls back `CAM_BACK_SWARM` while dispersed.
+- Third-person camera is a sphere (`CAM_RADIUS`) that collides with the level and chases a goal behind the player
+  (`CAM_LAG_*`, pulled back `CAM_BACK_SWARM` while dispersed). If a wall hides the goal it retraces the core's
+  breadcrumb trail, so it follows the swarm through gaps. Dispersed, it turns to face the swarm's centroid.
 - Dead players: `kill()` marks them and gives spheres an outward impulse; `step_debris` makes them tumble.
   The game respawns after 3 s.
 
@@ -69,19 +74,19 @@ Passes (all in `shader.wgsl`):
 1. **trace** (compute): primary ray per pixel at `TRACE_SCALE` (default 0.5) of window size. Surfaces get direct
    light from sphere emitters via weighted reservoir sampling (weight ~ `lum * r^2 * cos / d^2`, two picks, shadow ray
    to a random point on the light's disc) plus one cosine-sampled bounce with the same direct-light estimator at
-   the bounce point. Spheres display compressed emission (`EMITTER_DISPLAY`) plus light from neighbours.
+   the bounce point. Spheres are flat shaded: one colour each, compressed emission (`EMITTER_DISPLAY`).
 2. **temporal** (compute): reproject static surfaces with the previous view-proj, validate by id / normal / depth,
    blend with history count capped at 6 (lights move every frame, so long history smears).
 3. **spatial** (compute): 7x7 bilateral on normals and plane distance, static surfaces only.
 4. **present** (fragment): bilinear upscale, ACES tone map, tracers (closest-approach glow, depth tested against the
-   trace), crosshair, dither. Tracers and crosshair are drawn after tone mapping so they never enter history.
+   trace), crosshair, FPS counter (3x5 bitmap font, `Scene.fps`, 0 hides it), dither. Tracers and crosshair are drawn after tone mapping so they never enter history.
 
 There is no sky, ambient or fill light. Floor and ceiling boxes exist purely so light has something to bounce off.
 Tuning knobs: `EMIT` / `CORE_EMIT` in `game.rs`, `exposure` in the scene, `EMITTER_DISPLAY`, history cap, `TRACE_SCALE`.
 
 ## Status
 
-Done and tested (13 sim tests): sphere swarm, hp model, core, hitscan with penetration and wall blocking, humanoid rig
+Done and tested (15 sim tests): sphere swarm, hp model, core, hitscan with penetration and wall blocking, humanoid rig
 and walk cycle, boid dispersal, gap filtering and no re-forming inside walls, debris.
 Done and checked only through headless screenshots: ray tracer, third-person camera, tracers, crosshair, hit flash.
 **Not yet run on real hardware**: the interactive window (mouse grab, vsync, resize, `[` / `]` scale keys), the mouse
@@ -100,7 +105,7 @@ yaw fix, and real GPU performance of the tracer.
 4. **Doors and interaction** (coherent-mode only action).
 5. **Gameplay polish:** impact effects, HUD (hp / armour), respawn flow, scoring, more weapons, swarm-mass effects
    (heavier spheres lag more), stuck-sphere behaviour in narrow gaps.
-6. **Tuning:** `R_MIN`/`R_MAX`, `HP_K`, `SWARM_RADIUS`, `CORE_HIT_SCALE`, dispersed speed, shielding fraction of the
+6. **Tuning:** `R_MIN`/`R_MAX`, `ELEM_HP`, `REGEN_TIME`, `RECOIL`, `SWARM_RADIUS`, `CORE_HIT_SCALE`, dispersed speed, shielding fraction of the
    torso (test asserts at least 60% of directions are shielded; the real figure is unmeasured), and whether dispersed
    mode is too safe or too weak.
 7. **Later:** browser build (wgpu already targets WebGPU), spectator, level editor from a box list.
@@ -124,5 +129,5 @@ yaw fix, and real GPU performance of the tracer.
 cargo test                                  # sim tests
 cargo clippy --all-targets
 cargo run --release --bin swarmpf           # play
-cargo run --release --bin shot -- out 0.5   # writes out_walk/swarm/fire/aftermath.png
+cargo run --release --bin shot -- out 0.5   # writes out_walk/swarm/fire/aftermath/shotgun/gap/past_gap.png
 ```

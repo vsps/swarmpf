@@ -328,11 +328,8 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var col = vec3<f32>(0.0);
     var id = 0.0;
     if (h.kind == 2u) {
-        // A light: its own emission (shaded so it reads as a ball) plus light from neighbours.
-        let s = spheres[h.idx];
-        let ndv = max(dot(h.n, -d), 0.0);
-        col = s.emit.rgb * EMITTER_DISPLAY * (0.35 + 0.65 * ndv);
-        col += direct_light(p, h.n, vec3<f32>(s.emit.a), h.idx);
+        // A light, drawn flat: one colour per sphere, no shading or light from neighbours.
+        col = spheres[h.idx].emit.rgb * EMITTER_DISPLAY;
         id = f32(h.idx + 1u);
     } else {
         col = shade_diffuse(p, h.n, boxes[h.idx].albedo.rgb);
@@ -439,6 +436,56 @@ fn fetch_fin(p: vec2<i32>) -> vec3<f32> {
     return fin_in[u32(c.y * dim.x + c.x)].rgb;
 }
 
+// "123 FPS" in the top-left corner, from a 3x5 bitmap font (bit 14 = top-left pixel), on a
+// darkened backdrop. `sc` scales with the output height.
+fn draw_fps(p: vec2<f32>, sc: f32, col: vec3<f32>) -> vec3<f32> {
+    // 0-9, then F and P; S reuses 5.
+    var font = array<u32, 12>(
+        31599u, 11415u, 29671u, 29647u, 23497u, 31183u, 31215u, 29257u, 31727u, 31695u, 31140u, 31716u,
+    );
+    let px = 3.0 * sc;
+    let cell = floor((p - vec2<f32>(10.0 * sc)) / px);
+    // Seven characters of four columns (three lit plus a gap), five rows, one cell of padding.
+    if (cell.x < -1.0 || cell.y < -1.0 || cell.x > 28.0 || cell.y > 5.0) {
+        return col;
+    }
+    var out = col * 0.25;
+    if (cell.x < 0.0 || cell.y < 0.0 || cell.y > 4.0 || cell.x > 27.0) {
+        return out;
+    }
+    let ch = u32(cell.x) / 4u;
+    let cx = u32(cell.x) % 4u;
+    if (cx == 3u || ch == 3u) {
+        return out;
+    }
+    let fps = min(u32(round(g.params.w)), 999u);
+    var glyph = 0u;
+    if (ch == 0u) {
+        if (fps < 100u) {
+            return out;
+        }
+        glyph = fps / 100u;
+    } else if (ch == 1u) {
+        if (fps < 10u) {
+            return out;
+        }
+        glyph = (fps / 10u) % 10u;
+    } else if (ch == 2u) {
+        glyph = fps % 10u;
+    } else if (ch == 4u) {
+        glyph = 10u;
+    } else if (ch == 5u) {
+        glyph = 11u;
+    } else {
+        glyph = 5u;
+    }
+    let bit = 14u - (u32(cell.y) * 3u + cx);
+    if (((font[glyph] >> bit) & 1u) == 1u) {
+        out = vec3<f32>(1.0);
+    }
+    return out;
+}
+
 @fragment
 fn fs_present(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     let out_size = vec2<f32>(g.dims.zw);
@@ -497,6 +544,10 @@ fn fs_present(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         col = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(1.0, 0.15, 0.1), clamp(g.params.z * 6.0, 0.0, 1.0));
     } else if (arm_o) {
         col = vec3<f32>(0.0);
+    }
+
+    if (g.params.w > 0.0) {
+        col = draw_fps(fc.xy, sc, col);
     }
 
     // Tiny dither hides banding in the dark gradients.

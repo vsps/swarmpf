@@ -14,8 +14,17 @@ use crate::world::World;
 
 pub const R_MIN: f32 = 0.06;
 pub const R_MAX: f32 = 0.12;
-/// hp = ceil(HP_K * (r / R_MIN)^2): the smallest sphere takes HP_K damage, the largest 4x that.
-pub const HP_K: f32 = 2.0;
+/// Every sphere takes two hits, whatever its size or the weapon.
+pub const ELEM_HP: u8 = 2;
+/// Seconds per regrown sphere. Destroyed spheres come back first, nearest the core first.
+pub const REGEN_TIME: f32 = 3.0;
+/// Speed (m/s) a hit knocks a smallest-size sphere along the shot; bigger ones move less.
+pub const RECOIL: f32 = 3.5;
+/// Bounciness of sphere-sphere contacts within one swarm.
+const RESTITUTION: f32 = 0.5;
+/// Coherent contacts only fire once two spheres are this much closer than their slots are,
+/// so the rest pose (whose slots overlap) never fights the springs.
+const CONTACT_SLACK: f32 = 0.9;
 pub const CORE_RADIUS: f32 = 0.04;
 /// The core's hit sphere is inflated so it is hittable at all.
 pub const CORE_HIT_SCALE: f32 = 1.5;
@@ -28,13 +37,13 @@ pub const DISPERSED_SPEED: f32 = 6.5;
 pub const BLEND_TIME: f32 = 0.4;
 pub const SWARM_RADIUS: f32 = 1.0;
 
-/// Coherent mode: each sphere is attracted to its slot by a critically damped spring. It is
-/// soft on purpose, so the swarm visibly trails the skeleton instead of being welded to it.
-const K_SLOT: f32 = 300.0;
-const C_SLOT: f32 = 34.6;
+/// Coherent mode: each sphere is attracted to its slot by a soft, slightly underdamped spring
+/// (damping ratio ~0.9), so the swarm visibly trails and settles onto the skeleton.
+const K_SLOT: f32 = 150.0;
+const C_SLOT: f32 = 22.0;
 /// Fraction of the slot's velocity the damping matches. Below 1 the sphere lags its slot by
-/// about `C_SLOT * (1 - SLOT_FOLLOW) / K_SLOT` seconds of motion (~0.13 m at walking speed).
-const SLOT_FOLLOW: f32 = 0.75;
+/// about `C_SLOT * (1 - SLOT_FOLLOW) / K_SLOT` seconds of motion (~0.26 m at walking speed).
+const SLOT_FOLLOW: f32 = 0.6;
 /// Speed caps: the coherent body needs headroom for swinging feet on top of walking speed.
 const MAX_SPEED_SWARM: f32 = 14.0;
 const MAX_SPEED_BODY: f32 = 28.0;
@@ -53,11 +62,6 @@ impl Element {
     pub fn alive(&self) -> bool {
         self.hp > 0
     }
-}
-
-pub fn hp_for_radius(r: f32) -> u8 {
-    let k = r / R_MIN;
-    (HP_K * k * k).ceil().clamp(1.0, 255.0) as u8
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -93,6 +97,7 @@ pub struct Player {
     axes: Vec<Vec3>,
     noise: Vec<[f32; 6]>,
     time: f32,
+    regen_timer: f32,
 }
 
 impl Player {
@@ -146,15 +151,12 @@ impl Player {
             core_vel: Vec3::ZERO,
             elems: radii
                 .iter()
-                .map(|&r| {
-                    let hp = hp_for_radius(r);
-                    Element {
-                        pos: Vec3::ZERO,
-                        vel: Vec3::ZERO,
-                        r,
-                        hp,
-                        max_hp: hp,
-                    }
+                .map(|&r| Element {
+                    pos: Vec3::ZERO,
+                    vel: Vec3::ZERO,
+                    r,
+                    hp: ELEM_HP,
+                    max_hp: ELEM_HP,
                 })
                 .collect(),
             walk_phase: 0.0,
@@ -166,6 +168,7 @@ impl Player {
             axes,
             noise,
             time: 0.0,
+            regen_timer: 0.0,
         };
         p.refresh_targets();
         for i in 0..p.elems.len() {
@@ -316,6 +319,45 @@ impl Player {
             self.core.vel = Vec3::ZERO;
         }
         self.step_elements(world, dt);
+        self.regenerate(dt);
+    }
+
+    /// Restore one sphere every `REGEN_TIME` while any is missing or damaged. A destroyed
+    /// sphere regrows at the core and flows back out to its slot (or into the flock).
+    fn regenerate(&mut self, dt: f32) {
+        let hurt = |e: &Element| e.hp < e.max_hp;
+        if !self.elems.iter().any(hurt) {
+            self.regen_timer = 0.0;
+            return;
+        }
+        self.regen_timer += dt;
+        if self.regen_timer < REGEN_TIME {
+            return;
+        }
+        self.regen_timer -= REGEN_TIME;
+        // Destroyed before damaged, then innermost first so the core is re-covered.
+        let slots = &self.slots;
+        let i = (0..self.elems.len())
+            .filter(|&i| hurt(&self.elems[i]))
+            .min_by(|&a, &b| {
+                let (ea, eb) = (&self.elems[a], &self.elems[b]);
+                ea.hp
+                    .cmp(&eb.hp)
+                    .then(slots[a].depth.total_cmp(&slots[b].depth))
+            })
+            .unwrap();
+        let e = &mut self.elems[i];
+        if !e.alive() {
+            e.pos = self.core.pos;
+            e.vel = self.core.vel;
+        }
+        e.hp = e.max_hp;
+    }
+
+    /// A hit knocks the sphere along the shot; the slot spring or flock pulls it back.
+    pub fn recoil(&mut self, elem: usize, dir: Vec3) {
+        let e = &mut self.elems[elem];
+        e.vel += dir * (RECOIL * R_MIN / e.r);
     }
 
     fn step_elements(&mut self, world: &World, dt: f32) {
@@ -392,6 +434,9 @@ impl Player {
             let e = &mut self.elems[i];
             e.vel = (v + a * dt).clamp_len(MAX_SPEED_BODY * w_c + MAX_SPEED_SWARM * w_d);
             e.pos = p + e.vel * dt;
+        }
+        self.collide_elements();
+        for e in self.elems.iter_mut().filter(|e| e.alive()) {
             let n = world.push_sphere(&mut e.pos, e.r);
             if n != Vec3::ZERO {
                 let n = n.normalized();
@@ -399,6 +444,51 @@ impl Player {
                 if vn < 0.0 {
                     e.vel -= n * vn;
                 }
+            }
+        }
+    }
+
+    /// Spheres of one swarm bump into each other, so a hit sphere knocks its neighbours.
+    /// Coherent, the contact distance is capped by the slots' own spacing (see `CONTACT_SLACK`);
+    /// dispersed, it is the plain sum of radii. Mass goes with volume.
+    fn collide_elements(&mut self) {
+        let w_d = self.blend;
+        let n = self.elems.len();
+        for i in 0..n {
+            if !self.elems[i].alive() {
+                continue;
+            }
+            for j in i + 1..n {
+                let (a, b) = (&self.elems[i], &self.elems[j]);
+                if !b.alive() {
+                    continue;
+                }
+                let d = b.pos - a.pos;
+                let d2 = d.len2();
+                let touch = a.r + b.r;
+                let rest = (self.targets[j] - self.targets[i]).len() * CONTACT_SLACK;
+                let coherent = touch.min(rest);
+                let contact = coherent + (touch - coherent) * w_d;
+                if d2 >= contact * contact || d2 < 1e-12 {
+                    continue;
+                }
+                let dist = d2.sqrt();
+                let nrm = d * (1.0 / dist);
+                let (ia, ib) = (1.0 / (a.r * a.r * a.r), 1.0 / (b.r * b.r * b.r));
+                let (sa, sb) = (ia / (ia + ib), ib / (ia + ib));
+                let overlap = contact - dist;
+                let vn = (b.vel - a.vel).dot(nrm);
+                let dv = if vn < 0.0 {
+                    -(1.0 + RESTITUTION) * vn
+                } else {
+                    0.0
+                };
+                let a = &mut self.elems[i];
+                a.pos -= nrm * (overlap * sa);
+                a.vel -= nrm * (dv * sa);
+                let b = &mut self.elems[j];
+                b.pos += nrm * (overlap * sb);
+                b.vel += nrm * (dv * sb);
             }
         }
     }

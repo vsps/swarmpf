@@ -6,25 +6,21 @@ use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Weapon {
-    pub damage: u8,
-    /// Extra spheres the shot passes through after the first. Each pierced sphere halves damage (min 1).
+    /// Extra spheres the shot passes through after the first. Every sphere hit loses one hp.
     pub pierce: u8,
     pub range: f32,
 }
 
 impl Weapon {
     pub const RIFLE: Weapon = Weapon {
-        damage: 2,
         pierce: 0,
         range: 120.0,
     };
     pub const SHOTGUN_PELLET: Weapon = Weapon {
-        damage: 1,
         pierce: 0,
         range: 30.0,
     };
     pub const RAILGUN: Weapon = Weapon {
-        damage: 6,
         pierce: 3,
         range: 300.0,
     };
@@ -35,7 +31,6 @@ pub struct HitEvent {
     pub target: usize,
     /// Element index, or `CORE_ID` for the core.
     pub elem: u8,
-    pub damage: u8,
     /// The sphere was destroyed by this hit (for the core: the player died).
     pub destroyed: bool,
     pub t: f32,
@@ -78,7 +73,6 @@ pub fn hitscan(
     cands.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let mut events = Vec::new();
-    let mut dmg = weapon.damage;
     let mut pierce_left = weapon.pierce;
     for (t, pi, ei) in cands {
         if t > max_t {
@@ -92,14 +86,14 @@ pub fn hitscan(
             p.kill();
             true
         } else {
+            p.recoil(ei as usize, dir);
             let e = &mut p.elems[ei as usize];
-            e.hp = e.hp.saturating_sub(dmg);
+            e.hp = e.hp.saturating_sub(1);
             e.hp == 0
         };
         events.push(HitEvent {
             target: pi,
             elem: ei,
-            damage: dmg,
             destroyed,
             t,
         });
@@ -107,7 +101,6 @@ pub fn hitscan(
             break;
         }
         pierce_left -= 1;
-        dmg = (dmg / 2).max(1);
     }
     events
 }

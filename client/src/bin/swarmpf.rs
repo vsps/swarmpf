@@ -1,6 +1,7 @@
 //! Interactive client.
-//! WASD move, mouse look, Shift hold = disperse, LMB fire (rifle is automatic), 1/2/3 weapon, V first/third person,
-//! [ and ] lower / raise the ray-trace resolution, Esc release mouse.
+//! WASD move, mouse look, Shift hold = disperse, LMB fire (rifle is automatic),
+//! 1/2/3 rifle / shotgun / railgun, V first/third person,
+//! [ and ] lower / raise the ray-trace resolution, Esc release mouse. FPS shows top left.
 
 use client::game::Game;
 use client::renderer::Renderer;
@@ -40,6 +41,8 @@ struct App {
     grabbed: bool,
     last: Instant,
     acc: f32,
+    /// Smoothed frame time (s), for the FPS counter.
+    frame_time: f32,
 }
 
 impl App {
@@ -183,15 +186,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                self.acc += (now - self.last).as_secs_f32().min(0.1);
+                let dt = (now - self.last).as_secs_f32();
+                self.acc += dt.min(0.1);
                 self.last = now;
+                self.frame_time += (dt - self.frame_time) * 0.05;
                 while self.acc >= sim::DT {
                     let input = self.input();
                     self.game.tick(input);
                     self.acc -= sim::DT;
                 }
                 let status = self.game.status();
-                let scene = self.game.scene();
+                let mut scene = self.game.scene();
+                scene.fps = 1.0 / self.frame_time.max(1e-3);
                 if let Some(g) = &mut self.gfx {
                     g.window.set_title(&status);
                     match g.surface.get_current_texture() {
@@ -225,6 +231,7 @@ fn main() {
         grabbed: false,
         last: Instant::now(),
         acc: 0.0,
+        frame_time: 1.0 / 60.0,
     };
     el.run_app(&mut app).unwrap();
 }

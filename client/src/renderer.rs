@@ -65,6 +65,8 @@ pub struct Scene {
     pub tracers: Vec<TracerInst>,
     pub hit_flash: f32,
     pub exposure: f32,
+    /// Frames per second shown in the top-left corner; 0 hides the counter.
+    pub fps: f32,
 }
 
 struct Growable {
@@ -439,7 +441,12 @@ impl Renderer {
                 scene.boxes.len() as u32,
                 scene.tracers.len() as u32,
             ],
-            params: [self.frame_no as f32, scene.exposure, scene.hit_flash, 0.0],
+            params: [
+                self.frame_no as f32,
+                scene.exposure,
+                scene.hit_flash,
+                scene.fps,
+            ],
             flags: [self.srgb as u32, 0, 0, 0],
         };
         self.queue
