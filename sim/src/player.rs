@@ -28,8 +28,13 @@ pub const DISPERSED_SPEED: f32 = 6.5;
 pub const BLEND_TIME: f32 = 0.4;
 pub const SWARM_RADIUS: f32 = 1.0;
 
-const K_SLOT: f32 = 900.0;
-const C_SLOT: f32 = 54.0;
+/// Coherent mode: each sphere is attracted to its slot by a critically damped spring. It is
+/// soft on purpose, so the swarm visibly trails the skeleton instead of being welded to it.
+const K_SLOT: f32 = 300.0;
+const C_SLOT: f32 = 34.6;
+/// Fraction of the slot's velocity the damping matches. Below 1 the sphere lags its slot by
+/// about `C_SLOT * (1 - SLOT_FOLLOW) / K_SLOT` seconds of motion (~0.13 m at walking speed).
+const SLOT_FOLLOW: f32 = 0.75;
 /// Speed caps: the coherent body needs headroom for swinging feet on top of walking speed.
 const MAX_SPEED_SWARM: f32 = 14.0;
 const MAX_SPEED_BODY: f32 = 28.0;
@@ -335,9 +340,9 @@ impl Player {
             let mut a = Vec3::ZERO;
 
             if w_c > 0.0 {
-                // Spring to the slot, damped against the slot's own velocity.
+                // Attract to the slot, damped against most of the slot's own velocity.
                 let target = self.targets[i];
-                let tv = self.target_vels[i];
+                let tv = self.target_vels[i] * SLOT_FOLLOW;
                 a += ((target - p) * K_SLOT + (tv - v) * C_SLOT) * w_c;
             }
 

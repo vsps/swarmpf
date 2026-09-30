@@ -1,5 +1,5 @@
 //! Interactive client.
-//! WASD move, mouse look, Shift hold = disperse, hold LMB fire, 1/2/3 weapon, V first/third person,
+//! WASD move, mouse look, Shift hold = disperse, LMB fire (rifle is automatic), 1/2/3 weapon, V first/third person,
 //! [ and ] lower / raise the ray-trace resolution, Esc release mouse.
 
 use client::game::Game;
@@ -137,13 +137,14 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
+                state,
                 button: MouseButton::Left,
                 ..
             } => {
+                let down = state == ElementState::Pressed;
                 if self.grabbed {
-                    self.game.fire();
-                } else {
+                    self.game.trigger(down);
+                } else if down {
                     self.grab(true);
                 }
             }
@@ -156,7 +157,10 @@ impl ApplicationHandler for App {
                         KeyCode::KeyS => self.keys.s = down,
                         KeyCode::KeyD => self.keys.d = down,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys.shift = down,
-                        KeyCode::Escape if down => self.grab(false),
+                        KeyCode::Escape if down => {
+                            self.game.trigger(false);
+                            self.grab(false);
+                        }
                         KeyCode::KeyV if down => self.game.third_person = !self.game.third_person,
                         KeyCode::BracketLeft if down => {
                             if let Some(g) = &mut self.gfx {

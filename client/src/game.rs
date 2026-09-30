@@ -10,11 +10,17 @@ use sim::world::{Aabb, World};
 use sim::DT;
 
 pub const EYE_HEIGHT: f32 = 1.62;
-/// (name, weapon, seconds between shots, tracer colour)
-pub const WEAPONS: [(&str, Weapon, f32, [f32; 3]); 3] = [
-    ("rifle", Weapon::RIFLE, 0.11, [1.0, 0.85, 0.5]),
-    ("pellet", Weapon::SHOTGUN_PELLET, 0.06, [1.0, 0.5, 0.2]),
-    ("railgun", Weapon::RAILGUN, 0.9, [0.4, 0.9, 1.0]),
+/// (name, weapon, seconds between shots, automatic, tracer colour)
+pub const WEAPONS: [(&str, Weapon, f32, bool, [f32; 3]); 3] = [
+    ("rifle", Weapon::RIFLE, 0.11, true, [1.0, 0.85, 0.5]),
+    (
+        "pellet",
+        Weapon::SHOTGUN_PELLET,
+        0.06,
+        false,
+        [1.0, 0.5, 0.2],
+    ),
+    ("railgun", Weapon::RAILGUN, 0.9, false, [0.4, 0.9, 1.0]),
 ];
 
 const TRACER_SPEED: f32 = 320.0;
@@ -23,6 +29,12 @@ const TRACER_LEN: f32 = 7.0;
 const CAM_BACK: f32 = 3.2;
 const CAM_SHOULDER: f32 = 0.55;
 const CAM_UP: f32 = 0.35;
+/// Extra pull-back while dispersed, so the whole flock stays in view.
+const CAM_BACK_SWARM: f32 = 1.6;
+/// Time constants (s) of the camera pivot chasing the player: tight when coherent, loose
+/// when dispersed so the swarm visibly surges ahead of the view.
+const CAM_LAG_BODY: f32 = 0.04;
+const CAM_LAG_SWARM: f32 = 0.22;
 /// Emission radiance of a healthy sphere; the core is far brighter.
 const EMIT: f32 = 7.0;
 const CORE_EMIT: f32 = 60.0;
@@ -74,6 +86,9 @@ pub struct Game {
     cooldown: f32,
     pub hit_flash: f32,
     tracers: Vec<Tracer>,
+    /// Smoothed third-person pivot (player's feet) and dispersal amount the camera uses.
+    cam_feet: Vec3,
+    cam_swarm: f32,
 }
 
 fn level() -> World {
@@ -131,6 +146,7 @@ impl Game {
             .map(|(i, &p)| Player::spawn(100 + i as u32, p))
             .collect();
         let n = players.len();
+        let start_feet = players[0].feet;
         Game {
             world: level(),
             players,
@@ -148,6 +164,8 @@ impl Game {
             cooldown: 0.0,
             hit_flash: 0.0,
             tracers: Vec::new(),
+            cam_feet: start_feet,
+            cam_swarm: 0.0,
         }
     }
 
@@ -222,9 +240,32 @@ impl Game {
                 }
             }
         }
-        if self.fire_held {
+        self.follow_camera();
+        if self.fire_held && WEAPONS[self.weapon].3 {
             self.fire();
         }
+    }
+
+    /// Trigger pressed or released. Semi-automatic weapons fire once per press; automatic ones
+    /// keep firing from `tick` while held.
+    pub fn trigger(&mut self, down: bool) {
+        if down && !self.fire_held {
+            self.fire();
+        }
+        self.fire_held = down;
+    }
+
+    fn follow_camera(&mut self) {
+        let me = &self.players[0];
+        let swarm = me.blend;
+        self.cam_swarm += (swarm - self.cam_swarm) * (DT / 0.3).min(1.0);
+        // Snap on respawn instead of flying across the map.
+        if (me.feet - self.cam_feet).len() > 4.0 {
+            self.cam_feet = me.feet;
+            return;
+        }
+        let lag = CAM_LAG_BODY + (CAM_LAG_SWARM - CAM_LAG_BODY) * self.cam_swarm;
+        self.cam_feet += (me.feet - self.cam_feet) * (DT / lag).min(1.0);
     }
 
     /// Fire the current weapon along the crosshair. The shot leaves the shoulder and converges on
@@ -233,7 +274,7 @@ impl Game {
         if self.cooldown > 0.0 || !self.players[0].can_act() {
             return Vec::new();
         }
-        let (_, weapon, cooldown, color) = WEAPONS[self.weapon];
+        let (_, weapon, cooldown, _, color) = WEAPONS[self.weapon];
         self.cooldown = cooldown;
         let cam = self.camera(70f32.to_radians());
         let cam_eye = v3(cam.eye[0], cam.eye[1], cam.eye[2]);
@@ -311,14 +352,16 @@ impl Game {
         let right = v3(-1.0, 0.0, 0.0).rot_y(self.yaw);
         if self.third_person {
             // Over-the-shoulder: pivot near the head, pull back along the view, stop at walls.
-            let pivot = self.players[0].feet + v3(0.0, 1.5, 0.0) + right * CAM_SHOULDER;
+            // The pivot trails the player and pulls further back while dispersed.
+            let dist = CAM_BACK + CAM_BACK_SWARM * self.cam_swarm;
+            let pivot = self.cam_feet + v3(0.0, 1.5, 0.0) + right * CAM_SHOULDER;
             let back = -fwd + v3(0.0, CAM_UP / CAM_BACK, 0.0);
             let back = back.normalized();
             let margin = 0.25;
             let room = self
                 .world
-                .ray_cast(pivot, back, CAM_BACK + margin)
-                .unwrap_or(CAM_BACK + margin);
+                .ray_cast(pivot, back, dist + margin)
+                .unwrap_or(dist + margin);
             let e = pivot + back * (room - margin).max(0.15);
             Camera::from_angles([e.x, e.y, e.z], self.yaw, self.pitch, fov_y)
         } else {

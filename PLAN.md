@@ -4,7 +4,8 @@
 
 Multiplayer FPS. Each player is a cloud of spheres around one small, lethal core.
 
-- **Coherent mode:** the spheres hold a humanoid shape on a procedural walk cycle. The body moves as a capsule
+- **Coherent mode:** the spheres are attracted to slots on a humanoid rig (soft spring, ~0.1 m lag at walking
+  speed, `K_SLOT` / `SLOT_FOLLOW`) running a procedural walk cycle. The body moves as a capsule
   and can fire weapons and use things (doors are not implemented yet).
 - **Dispersed mode:** the spheres flock (boids) around the core, which is the flock leader. The player moves
   faster and fits through gaps the body cannot, but cannot act. Re-forming needs room for the body capsule.
@@ -56,6 +57,8 @@ client/   wgpu renderer + local game
 - Yaw 0 faces +Z; yaw increases toward +X, which is the player's LEFT. So mouse-right decreases yaw.
 - Body space is +Y up, +Z forward, +X left ("L" joints/slots are +X). `Input.strafe > 0` means right.
 - Fixed tick 60 Hz (`sim::DT`). The client accumulates real time and ticks the sim.
+- Rifle is automatic (hold LMB); pellet and railgun fire once per click (`WEAPONS` auto flag, `Game::trigger`).
+- Third-person camera pivot trails the player (`CAM_LAG_*`) and pulls back `CAM_BACK_SWARM` while dispersed.
 - Dead players: `kill()` marks them and gives spheres an outward impulse; `step_debris` makes them tumble.
   The game respawns after 3 s.
 
