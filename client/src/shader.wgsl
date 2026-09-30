@@ -58,6 +58,8 @@ struct Tracer {
 const PI: f32 = 3.14159265;
 const NO_SPHERE: u32 = 0xffffffffu;
 const FAR: f32 = 1.0e9;
+// Emitters are far brighter than anything they light; show them compressed so they keep their colour.
+const EMITTER_DISPLAY: f32 = 0.16;
 
 // ---------------------------------------------------------------- random
 
@@ -329,7 +331,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // A light: its own emission (shaded so it reads as a ball) plus light from neighbours.
         let s = spheres[h.idx];
         let ndv = max(dot(h.n, -d), 0.0);
-        col = s.emit.rgb * (0.3 + 0.7 * ndv);
+        col = s.emit.rgb * EMITTER_DISPLAY * (0.35 + 0.65 * ndv);
         col += direct_light(p, h.n, vec3<f32>(s.emit.a), h.idx);
         id = f32(h.idx + 1u);
     } else {
@@ -372,7 +374,8 @@ fn temporal_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let expect = length(gp.xyz - g.prev_eye.xyz);
             if (pn.w == gn.w && dot(pn.xyz, gn.xyz) > 0.9 && abs(pt - expect) < 0.05 * expect + 0.02) {
                 let hist = acc_prev[pi];
-                let count = min(hist.w + 1.0, 12.0);
+                // Short history: every light moves, so long accumulation would smear.
+                let count = min(hist.w + 1.0, 6.0);
                 out = vec4<f32>(mix(hist.rgb, cur.rgb, 1.0 / count), count);
             }
         }

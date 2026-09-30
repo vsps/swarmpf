@@ -7,7 +7,7 @@ use sim::player::Input;
 
 const W: u32 = 1280;
 const H: u32 = 720;
-const WARMUP: usize = 8;
+const WARMUP: usize = 16;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 fn main() {

@@ -15,13 +15,17 @@ Multiplayer FPS where each player is a cloud of spheres.
 
 - `sim/`: shared, dependency-free simulation (movement, flocking, rig, hitscan). It runs the same on the
   server and in clients.
-- `client/`: `wgpu` renderer (billboard-impostor spheres with exact silhouettes and depth, instanced boxes),
-  a local test level with bots, and two binaries:
-  - `swarmpf`: interactive window. WASD move, mouse look, hold Shift to disperse, LMB fire, 1/2/3 weapon,
-    V third person, Esc releases the mouse.
-  - `shot <prefix>`: headless scripted scenario that writes PNGs (works on software Vulkan, e.g. llvmpipe).
+- `client/`: `wgpu` compute ray tracer and a local test level with bots. Every sphere is a light and the
+  only light in the scene: surfaces get direct light from importance-sampled emitters with shadow rays plus one
+  diffuse bounce, then temporal and edge-aware spatial denoising. Tracers and the crosshair are drawn over the
+  tone-mapped image so they do not smear. Two binaries:
+  - `swarmpf`: interactive window, third-person over-the-shoulder camera. WASD move, mouse look, hold Shift to
+    disperse, hold LMB to fire, 1/2/3 weapon, V toggles first person, `[` / `]` lower / raise the ray-trace
+    resolution (default half), Esc releases the mouse.
+  - `shot <prefix> [trace_scale]`: headless scripted scenario that writes PNGs (works on software Vulkan, e.g.
+    llvmpipe).
 
-Planned: `server/` (authoritative, UDP) and a compute ray-tracing pass.
+Networking (`server/`, authoritative UDP) is deliberately on hold.
 
 ```
 cargo test
