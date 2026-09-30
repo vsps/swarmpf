@@ -1,5 +1,6 @@
 //! Interactive client.
-//! WASD move, mouse look, Shift hold = disperse, LMB fire, 1/2/3 weapon, V third person, Esc release mouse.
+//! WASD move, mouse look, Shift hold = disperse, hold LMB fire, 1/2/3 weapon, V first/third person,
+//! [ and ] lower / raise the ray-trace resolution, Esc release mouse.
 
 use client::game::Game;
 use client::renderer::Renderer;
@@ -11,6 +12,9 @@ use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
+
+/// Fraction of the window resolution that is ray traced. Lower it if the frame rate is poor.
+const TRACE_SCALE: f32 = 0.5;
 
 struct Gfx {
     window: Arc<Window>,
@@ -95,7 +99,14 @@ impl ApplicationHandler for App {
             .expect("surface config");
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
-        let renderer = Renderer::new(device, queue, config.format, config.width, config.height);
+        let renderer = Renderer::new(
+            device,
+            queue,
+            config.format,
+            config.width,
+            config.height,
+            TRACE_SCALE,
+        );
         self.gfx = Some(Gfx {
             window,
             surface,
@@ -108,7 +119,8 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, ev: DeviceEvent) {
         if let (DeviceEvent::MouseMotion { delta }, true) = (ev, self.grabbed) {
             let sens = 0.0025;
-            self.game.yaw += delta.0 as f32 * sens;
+            // Yaw grows towards the player's left, so moving the mouse right decreases it.
+            self.game.yaw -= delta.0 as f32 * sens;
             self.game.pitch = (self.game.pitch - delta.1 as f32 * sens).clamp(-1.5, 1.5);
         }
     }
@@ -146,6 +158,18 @@ impl ApplicationHandler for App {
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys.shift = down,
                         KeyCode::Escape if down => self.grab(false),
                         KeyCode::KeyV if down => self.game.third_person = !self.game.third_person,
+                        KeyCode::BracketLeft if down => {
+                            if let Some(g) = &mut self.gfx {
+                                let s = g.renderer.scale() - 0.125;
+                                g.renderer.set_scale(s);
+                            }
+                        }
+                        KeyCode::BracketRight if down => {
+                            if let Some(g) = &mut self.gfx {
+                                let s = g.renderer.scale() + 0.125;
+                                g.renderer.set_scale(s);
+                            }
+                        }
                         KeyCode::Digit1 if down => self.game.cycle_weapon(0),
                         KeyCode::Digit2 if down => self.game.cycle_weapon(1),
                         KeyCode::Digit3 if down => self.game.cycle_weapon(2),

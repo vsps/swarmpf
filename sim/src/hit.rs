@@ -111,3 +111,30 @@ pub fn hitscan(
     }
     events
 }
+
+/// Distance along a unit ray to the first thing it would hit (level, or any other player's
+/// sphere or core), or `max`. Used to aim shots at what a third-person crosshair points at.
+pub fn aim_distance(
+    players: &[Player],
+    shooter: usize,
+    origin: Vec3,
+    dir: Vec3,
+    max: f32,
+    world: &World,
+) -> f32 {
+    let mut best = world.ray_cast(origin, dir, max).unwrap_or(max);
+    for (pi, p) in players.iter().enumerate() {
+        if pi == shooter || !p.alive {
+            continue;
+        }
+        if let Some(t) = ray_sphere(origin, dir, p.core.pos, p.core.r * CORE_HIT_SCALE) {
+            best = best.min(t);
+        }
+        for e in p.elems.iter().filter(|e| e.alive()) {
+            if let Some(t) = ray_sphere(origin, dir, e.pos, e.r) {
+                best = best.min(t);
+            }
+        }
+    }
+    best
+}

@@ -1,5 +1,5 @@
 //! Headless renderer: runs a scripted scenario and writes PNG screenshots.
-//! Usage: shot <out_prefix> [scenario]
+//! Usage: shot <out_prefix> [trace_scale]
 
 use client::game::Game;
 use client::renderer::Renderer;
@@ -7,10 +7,15 @@ use sim::player::Input;
 
 const W: u32 = 1280;
 const H: u32 = 720;
+const WARMUP: usize = 8;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 fn main() {
     let prefix = std::env::args().nth(1).unwrap_or_else(|| "shot".into());
+    let scale: f32 = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(0.5);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -21,7 +26,7 @@ fn main() {
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .expect("device");
-    let mut renderer = Renderer::new(device.clone(), queue.clone(), FORMAT, W, H);
+    let mut renderer = Renderer::new(device.clone(), queue.clone(), FORMAT, W, H, scale);
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("target"),
         size: wgpu::Extent3d {
@@ -40,7 +45,11 @@ fn main() {
 
     let mut game = Game::new();
     let snap = |game: &Game, renderer: &mut Renderer, name: &str| {
-        renderer.render(&view, &game.scene());
+        // Let the temporal filter converge on the (static) frame.
+        let scene = game.scene();
+        for _ in 0..WARMUP {
+            renderer.render(&view, &scene);
+        }
         save(&device, &queue, &target, &format!("{prefix}_{name}.png"));
         eprintln!("wrote {prefix}_{name}.png");
     };
@@ -76,20 +85,31 @@ fn main() {
     );
     snap(&game, &mut renderer, "swarm");
 
-    // 3. First person: face the statue bot and fire the rifle, then the railgun.
-    game.third_person = false;
+    // 3. Third person: put the crosshair on the statue bot and fire; catch the tracer in flight.
     run(&mut game, 1.0, Input::default());
-    let me = game.eye();
-    let t = game.players[1].core.pos;
-    game.yaw = (t.x - me.x).atan2(t.z - me.z);
-    let flat = ((t.x - me.x).powi(2) + (t.z - me.z).powi(2)).sqrt();
-    game.pitch = (t.y - me.y).atan2(flat);
-    for k in 0..6 {
-        game.weapon = if k < 3 { 0 } else { 2 };
-        game.fire();
-        run(&mut game, 0.1, Input::default());
+    for _ in 0..4 {
+        let cam = game.camera(70f32.to_radians());
+        let t = game.players[1].core.pos;
+        let (dx, dy, dz) = (t.x - cam.eye[0], t.y - cam.eye[1], t.z - cam.eye[2]);
+        game.yaw = dx.atan2(dz);
+        game.pitch = dy.atan2((dx * dx + dz * dz).sqrt());
     }
-    snap(&game, &mut renderer, "fps");
+    game.weapon = 2;
+    let hits = game.fire();
+    eprintln!("railgun hits: {}", hits.len());
+    run(&mut game, 0.035, Input::default());
+    snap(&game, &mut renderer, "fire");
+    // Keep firing until the statue is dead, then show the aftermath.
+    game.weapon = 0;
+    for _ in 0..400 {
+        game.fire();
+        run(&mut game, 0.05, Input::default());
+        if !game.players[1].alive {
+            break;
+        }
+    }
+    run(&mut game, 1.5, Input::default());
+    snap(&game, &mut renderer, "aftermath");
     eprintln!("{}", game.status());
 }
 
