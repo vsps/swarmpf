@@ -18,10 +18,16 @@ pub const R_MAX: f32 = 0.12;
 pub const ELEM_HP: u8 = 2;
 /// Seconds per regrown sphere. Destroyed spheres come back first, nearest the core first.
 pub const REGEN_TIME: f32 = 3.0;
-/// Speed (m/s) a hit knocks a smallest-size sphere along the shot; bigger ones move less.
-pub const RECOIL: f32 = 3.5;
+/// Speed (m/s) a hit knocks a smallest-size sphere along the shot; bigger ones move less
+/// (by the square root of the size ratio, so every hit reads).
+pub const RECOIL: f32 = 10.0;
+/// After a hit the sphere's slot spring goes slack for this long (s), so it visibly flies off
+/// and bumps its neighbours before being reeled back in.
+pub const STUN_TIME: f32 = 0.45;
+/// Spring strength left at the start of a stun (it recovers linearly).
+const STUN_FLOOR: f32 = 0.05;
 /// Bounciness of sphere-sphere contacts within one swarm.
-const RESTITUTION: f32 = 0.5;
+const RESTITUTION: f32 = 0.8;
 /// Coherent contacts only fire once two spheres are this much closer than their slots are,
 /// so the rest pose (whose slots overlap) never fights the springs.
 const CONTACT_SLACK: f32 = 0.9;
@@ -37,13 +43,16 @@ pub const DISPERSED_SPEED: f32 = 6.5;
 pub const BLEND_TIME: f32 = 0.4;
 pub const SWARM_RADIUS: f32 = 1.0;
 
-/// Coherent mode: each sphere is attracted to its slot by a soft, slightly underdamped spring
-/// (damping ratio ~0.9), so the swarm visibly trails and settles onto the skeleton.
-const K_SLOT: f32 = 150.0;
-const C_SLOT: f32 = 22.0;
+/// Coherent mode: each sphere is attracted to its slot by a soft, underdamped spring. Stiffness
+/// varies per sphere (heavier is softer, plus a random factor from the seed), so spheres trail
+/// by different amounts and the body wobbles and smears instead of moving as one rigid piece.
+const K_SLOT: f32 = 70.0;
+const K_JITTER: (f32, f32) = (0.6, 1.4);
+/// Damping ratio of the slot spring: below 1, spheres overshoot and wobble when you stop.
+const SLOT_ZETA: f32 = 0.55;
 /// Fraction of the slot's velocity the damping matches. Below 1 the sphere lags its slot by
-/// about `C_SLOT * (1 - SLOT_FOLLOW) / K_SLOT` seconds of motion (~0.26 m at walking speed).
-const SLOT_FOLLOW: f32 = 0.6;
+/// about `2 * SLOT_ZETA * (1 - SLOT_FOLLOW) / sqrt(k)` seconds of motion.
+const SLOT_FOLLOW: f32 = 0.5;
 /// Speed caps: the coherent body needs headroom for swinging feet on top of walking speed.
 const MAX_SPEED_SWARM: f32 = 14.0;
 const MAX_SPEED_BODY: f32 = 28.0;
@@ -96,6 +105,9 @@ pub struct Player {
     target_vels: Vec<Vec3>,
     axes: Vec<Vec3>,
     noise: Vec<[f32; 6]>,
+    /// Per-element slot spring stiffness, and time left on its post-hit slack spell.
+    stiff: Vec<f32>,
+    stun: Vec<f32>,
     time: f32,
     regen_timer: f32,
 }
@@ -132,6 +144,10 @@ impl Player {
                 ]
             })
             .collect();
+        let stiff = radii
+            .iter()
+            .map(|&r| K_SLOT * rng.range(K_JITTER.0, K_JITTER.1) * (R_MIN / r))
+            .collect();
 
         let mut p = Player {
             seed,
@@ -167,6 +183,8 @@ impl Player {
             target_vels: vec![Vec3::ZERO; NUM_SLOTS],
             axes,
             noise,
+            stiff,
+            stun: vec![0.0; NUM_SLOTS],
             time: 0.0,
             regen_timer: 0.0,
         };
@@ -319,6 +337,9 @@ impl Player {
             self.core.vel = Vec3::ZERO;
         }
         self.step_elements(world, dt);
+        for s in &mut self.stun {
+            *s = (*s - dt).max(0.0);
+        }
         self.regenerate(dt);
     }
 
@@ -354,10 +375,12 @@ impl Player {
         e.hp = e.max_hp;
     }
 
-    /// A hit knocks the sphere along the shot; the slot spring or flock pulls it back.
+    /// A hit knocks the sphere along the shot and slackens its slot spring for `STUN_TIME`;
+    /// it bumps its neighbours, then the spring or flock pulls it back.
     pub fn recoil(&mut self, elem: usize, dir: Vec3) {
         let e = &mut self.elems[elem];
-        e.vel += dir * (RECOIL * R_MIN / e.r);
+        e.vel += dir * (RECOIL * (R_MIN / e.r).sqrt());
+        self.stun[elem] = STUN_TIME;
     }
 
     fn step_elements(&mut self, world: &World, dt: f32) {
@@ -382,10 +405,13 @@ impl Player {
             let mut a = Vec3::ZERO;
 
             if w_c > 0.0 {
-                // Attract to the slot, damped against most of the slot's own velocity.
+                // Attract to the slot, damped against part of the slot's own velocity.
+                let slack = self.stun[i] / STUN_TIME;
+                let k = self.stiff[i] * (1.0 - (1.0 - STUN_FLOOR) * slack);
+                let c = 2.0 * SLOT_ZETA * k.sqrt();
                 let target = self.targets[i];
                 let tv = self.target_vels[i] * SLOT_FOLLOW;
-                a += ((target - p) * K_SLOT + (tv - v) * C_SLOT) * w_c;
+                a += ((target - p) * k + (tv - v) * c) * w_c;
             }
 
             if w_d > 0.0 {

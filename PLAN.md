@@ -4,8 +4,9 @@
 
 Multiplayer FPS. Each player is a cloud of spheres around one small, lethal core.
 
-- **Coherent mode:** the spheres are attracted to slots on a humanoid rig (soft spring, ~0.26 m lag at walking
-  speed, `K_SLOT` / `SLOT_FOLLOW`). A swarm's spheres collide with each other (`collide_elements`), so a hit
+- **Coherent mode:** the spheres are attracted to slots on a humanoid rig (soft underdamped springs, stiffness
+  varied per sphere so they trail by different amounts, ~0.3 m mean lag at walking speed; `K_SLOT`, `K_JITTER`,
+  `SLOT_ZETA`, `SLOT_FOLLOW`). A swarm's spheres collide with each other (`collide_elements`), so a hit
   sphere knocks its neighbours; coherent contacts only fire when two spheres are closer than their slots allow running a procedural walk cycle. The body moves as a capsule
   and can fire weapons and use things (doors are not implemented yet).
 - **Dispersed mode:** the spheres flock (boids) around the core, which is the flock leader. The player moves
@@ -19,7 +20,8 @@ Multiplayer FPS. Each player is a cloud of spheres around one small, lethal core
 - **Spheres, not cubes.** Ray-sphere is one dot product, one discriminant and a sqrt. Boid separation is
   `dist < ri + rj`. Sphere vs box collision is a clamp. Normals are free.
 - **Per-sphere health.** Every sphere has `ELEM_HP` = 2: each hit removes 1 whatever the weapon, and hits knock the
-  sphere along the shot (`RECOIL`, less for bigger spheres). Each player regrows one sphere every `REGEN_TIME` (3 s),
+  sphere along the shot (`RECOIL`) and slacken its spring for `STUN_TIME`, so it flies ~0.35 m and bumps its
+  neighbours before being reeled back. Each player regrows one sphere every `REGEN_TIME` (3 s),
   destroyed before damaged, innermost first; a regrown sphere appears at the core. Radius is random in
   `[R_MIN, R_MAX]` from the player's seed (bigger sit on the outer shell) and is regenerated from the seed, never sent.
 - **Core.** One tiny sphere (`CORE_RADIUS` 0.04) buried in the chest, the flock leader when dispersed. Any hit kills.
