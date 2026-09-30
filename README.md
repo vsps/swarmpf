@@ -15,9 +15,16 @@ Multiplayer FPS where each player is a cloud of spheres.
 
 - `sim/`: shared, dependency-free simulation (movement, flocking, rig, hitscan). It runs the same on the
   server and in clients.
+- `client/`: `wgpu` renderer (billboard-impostor spheres with exact silhouettes and depth, instanced boxes),
+  a local test level with bots, and two binaries:
+  - `swarmpf`: interactive window. WASD move, mouse look, hold Shift to disperse, LMB fire, 1/2/3 weapon,
+    V third person, Esc releases the mouse.
+  - `shot <prefix>`: headless scripted scenario that writes PNGs (works on software Vulkan, e.g. llvmpipe).
 
-Planned: `server/` (authoritative, UDP), `client/` (winit + wgpu, billboard spheres, then a compute ray tracer).
+Planned: `server/` (authoritative, UDP) and a compute ray-tracing pass.
 
 ```
 cargo test
+cargo run --release --bin swarmpf
+cargo run --release --bin shot -- out
 ```

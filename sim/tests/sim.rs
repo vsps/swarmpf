@@ -154,7 +154,7 @@ fn penetration_passes_through_multiple_spheres() {
     assert_eq!(players[1].elems[0].hp, 18);
 
     let ev = hitscan(&mut players, 0, origin, dir, Weapon::RAILGUN, &world);
-    assert_eq!(ev.len(), 4.min(3)); // only three spheres exist on the line
+    assert_eq!(ev.len(), 3); // only three spheres exist on the line
     assert_eq!(
         ev.iter().map(|e| e.damage).collect::<Vec<_>>(),
         vec![6, 3, 1]

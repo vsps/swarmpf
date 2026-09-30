@@ -245,7 +245,7 @@ impl Player {
             || (self.want_disperse
                 && !Self::body_fits(world, self.core.pos - v3(0.0, CORE_HEIGHT, 0.0)));
 
-        let dir = v3(input.strafe, 0.0, input.forward)
+        let dir = v3(-input.strafe, 0.0, input.forward)
             .clamp_len(1.0)
             .rot_y(self.yaw);
 
@@ -402,7 +402,36 @@ impl Player {
         self.elems.iter().filter(|e| e.alive()).count()
     }
 
+    /// Kill the player: the core is gone, so the body falls apart into debris.
     pub fn kill(&mut self) {
+        if !self.alive {
+            return;
+        }
         self.alive = false;
+        let mut rng = Rng::new(self.seed ^ 0xDEAD);
+        let core = self.core.pos;
+        for e in self.elems.iter_mut().filter(|e| e.alive()) {
+            let out = (e.pos - core).normalized();
+            e.vel = out * rng.range(1.0, 4.0) + v3(0.0, rng.range(1.0, 4.0), 0.0);
+        }
+    }
+
+    /// Advance a dead player's spheres: they tumble to the floor and settle.
+    pub fn step_debris(&mut self, world: &World, dt: f32) {
+        for e in self.elems.iter_mut().filter(|e| e.alive()) {
+            e.vel.y -= 9.8 * dt;
+            e.pos += e.vel * dt;
+            let n = world.push_sphere(&mut e.pos, e.r);
+            if n != Vec3::ZERO {
+                let n = n.normalized();
+                let vn = e.vel.dot(n);
+                if vn < 0.0 {
+                    // Bounce a little, then lose horizontal speed to friction.
+                    e.vel -= n * vn * 1.3;
+                    e.vel.x *= 0.9;
+                    e.vel.z *= 0.9;
+                }
+            }
+        }
     }
 }
