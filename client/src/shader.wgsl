@@ -14,8 +14,8 @@ struct Globals {
     dims: vec4<u32>,    // trace w, trace h, output w, output h
     counts: vec4<u32>,  // spheres, groups, boxes, tracers
     params: vec4<f32>,  // frame, exposure, hit_flash, unused
-    flags: vec4<u32>,   // x: target is sRGB, y: raw (no upscale filtering, accumulation, blur, dither),
-                        // z: lighting samples per pixel
+    flags: vec4<u32>,   // x: target is sRGB, y: raw (nearest upscale, no blur, no dither),
+                        // z: lighting samples per pixel, w: temporal accumulation on
 };
 
 struct Sphere {
@@ -447,8 +447,8 @@ fn temporal_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gp = gpos_r[idx];
     let gn = gnrm_r[idx];
     // Lights move every frame and misses carry no history; only static surfaces accumulate.
-    // Raw mode keeps no history at all.
-    if (gn.w >= 0.0 || g.flags.y != 0u) {
+    // With temporal accumulation off, no surface keeps history.
+    if (gn.w >= 0.0 || g.flags.w == 0u) {
         acc_out[idx] = vec4<f32>(cur.rgb, 1.0);
         return;
     }
@@ -567,109 +567,6 @@ fn fetch_fin(p: vec2<i32>) -> vec3<f32> {
     return fin_in[u32(c.y * dim.x + c.x)].rgb;
 }
 
-// Glyph code of the character at `i` of an unsigned number printed `width` wide, right aligned
-// (blank for leading positions) or left aligned.
-const BLANK: u32 = 99u;
-fn digit_at(v: u32, i: u32, width: u32, right: bool) -> u32 {
-    var nd = 1u;
-    var t = v / 10u;
-    while (t > 0u) {
-        nd += 1u;
-        t /= 10u;
-    }
-    var pos = 0u; // digit index from the left of the number
-    if (right) {
-        if (i + nd < width) {
-            return BLANK;
-        }
-        pos = i + nd - width;
-    } else {
-        if (i >= nd) {
-            return BLANK;
-        }
-        pos = i;
-    }
-    var p = 1u;
-    for (var k = 0u; k + 1u + pos < nd; k++) {
-        p *= 10u;
-    }
-    return (v / p) % 10u;
-}
-
-// Stats in the top-left corner, from a 3x5 bitmap font (bit 14 = top-left pixel), on a darkened
-// backdrop; `sc` scales with the output height.
-//   line 0: "123 FPS"
-//   line 1: "1280X720 100%"  ray-traced resolution and its share of the output width
-//   line 2: "4 SPP"          lighting samples per pixel
-fn draw_stats(p: vec2<f32>, sc: f32, col: vec3<f32>) -> vec3<f32> {
-    // 0-9, F, P, X, %; S reuses 5.
-    var font = array<u32, 14>(
-        31599u, 11415u, 29671u, 29647u, 23497u, 31183u, 31215u, 29257u, 31727u, 31695u,
-        31140u, 31716u, 23213u, 21157u,
-    );
-    let px = 3.0 * sc;
-    let cell = floor((p - vec2<f32>(10.0 * sc)) / px);
-    // Up to 13 characters of four columns (three lit plus a gap); three lines of five rows with
-    // one-row gaps; one cell of padding all round.
-    let cols = 13.0 * 4.0 - 1.0;
-    if (cell.x < -1.0 || cell.y < -1.0 || cell.x > cols || cell.y > 17.0) {
-        return col;
-    }
-    var out = col * 0.25;
-    if (cell.x < 0.0 || cell.y < 0.0 || cell.x >= cols || cell.y > 16.0 || u32(cell.y) % 6u == 5u) {
-        return out;
-    }
-    let line = u32(cell.y) / 6u;
-    let row = u32(cell.y) % 6u;
-    let ch = u32(cell.x) / 4u;
-    let cx = u32(cell.x) % 4u;
-    if (cx == 3u) {
-        return out;
-    }
-    var glyph = BLANK;
-    if (line == 0u) {
-        let fps = min(u32(round(g.params.w)), 999u);
-        if (ch < 3u) {
-            glyph = digit_at(fps, ch, 3u, true);
-        } else if (ch == 4u) {
-            glyph = 10u;
-        } else if (ch == 5u) {
-            glyph = 11u;
-        } else if (ch == 6u) {
-            glyph = 5u;
-        }
-    } else if (line == 2u) {
-        if (ch < 2u) {
-            glyph = digit_at(min(max(g.flags.z, 1u), 99u), ch, 2u, true);
-        } else if (ch == 3u) {
-            glyph = 5u;
-        } else if (ch == 4u || ch == 5u) {
-            glyph = 11u;
-        }
-    } else {
-        let pct = u32(round(100.0 * f32(g.dims.x) / f32(g.dims.z)));
-        if (ch < 4u) {
-            glyph = digit_at(min(g.dims.x, 9999u), ch, 4u, true);
-        } else if (ch == 4u) {
-            glyph = 12u;
-        } else if (ch < 9u) {
-            glyph = digit_at(min(g.dims.y, 9999u), ch - 5u, 4u, false);
-        } else if (ch < 12u) {
-            glyph = digit_at(pct, ch - 9u, 3u, true);
-        } else if (ch == 12u) {
-            glyph = 13u;
-        }
-    }
-    if (glyph == BLANK) {
-        return out;
-    }
-    let bit = 14u - (row * 3u + cx);
-    if (((font[glyph] >> bit) & 1u) == 1u) {
-        out = vec3<f32>(1.0);
-    }
-    return out;
-}
-
 @fragment
 fn fs_present(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     let out_size = vec2<f32>(g.dims.zw);
@@ -735,10 +632,6 @@ fn fs_present(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         col = vec3<f32>(0.0);
     }
 
-    if (g.params.w > 0.0) {
-        col = draw_stats(fc.xy, sc, col);
-    }
-
     // Tiny dither hides banding in the dark gradients (off in raw mode).
     if (g.flags.y == 0u) {
         let n = f32(pcg(u32(fc.x) + u32(fc.y) * 8192u)) * (1.0 / 4294967296.0) - 0.5;
@@ -748,4 +641,54 @@ fn fs_present(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
         col = pow(max(col, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     }
     return vec4<f32>(col, 1.0);
+}
+
+// ---------------------------------------------------------------- ui
+
+// HUD and menu quads (see ui.rs): a solid rectangle, or one 3x5 glyph whose lit cells are opaque.
+struct UiInst {
+    rect: vec4<f32>,    // x, y, w, h in output pixels, y down
+    color: vec4<f32>,   // linear rgb, alpha
+    glyph: vec4<u32>,   // x: bits (bit 14 = top-left), y: 1 = glyph, 0 = rectangle
+};
+@group(0) @binding(20) var<storage, read> ui: array<UiInst>;
+
+struct UiOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) inst: u32,
+};
+
+@vertex
+fn vs_ui(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> UiOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+    );
+    let c = corners[vi];
+    let r = ui[ii].rect;
+    let px = r.xy + c * r.zw;
+    let size = vec2<f32>(g.dims.zw);
+    var out: UiOut;
+    out.pos = vec4<f32>(px.x / size.x * 2.0 - 1.0, 1.0 - px.y / size.y * 2.0, 0.0, 1.0);
+    out.uv = c;
+    out.inst = ii;
+    return out;
+}
+
+@fragment
+fn fs_ui(v: UiOut) -> @location(0) vec4<f32> {
+    let u = ui[v.inst];
+    if (u.glyph.y != 0u) {
+        let cell = min(vec2<u32>(v.uv * vec2<f32>(3.0, 5.0)), vec2<u32>(2u, 4u));
+        let bit = 14u - (cell.y * 3u + cell.x);
+        if (((u.glyph.x >> bit) & 1u) == 0u) {
+            discard;
+        }
+    }
+    var rgb = u.color.rgb;
+    if (g.flags.x == 0u) {
+        rgb = pow(rgb, vec3<f32>(1.0 / 2.2));
+    }
+    return vec4<f32>(rgb, u.color.a);
 }

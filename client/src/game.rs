@@ -598,7 +598,7 @@ impl Game {
             tracers,
             hit_flash: self.hit_flash,
             exposure: 1.0,
-            fps: 0.0,
+            ui: Vec::new(),
         }
     }
 }

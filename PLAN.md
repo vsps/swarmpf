@@ -54,6 +54,7 @@ sim/      shared simulation, tests in sim/tests/sim.rs
 client/   wgpu renderer + local game
   src/shader.wgsl   trace / temporal / spatial / present passes
   src/renderer.rs   buffers, bind groups, pass orchestration
+  src/ui.rs         pixel font, HUD and settings panel (CPU layout, drawn as quads)
   src/game.rs       test level, bots, firing, tracers, third-person camera, scene builder
   src/camera.rs     matrices and yaw/pitch camera
   src/bin/swarmpf.rs  interactive window
@@ -88,13 +89,20 @@ Passes (all in `shader.wgsl`):
 3. **spatial** (compute): 7x7 bilateral on normals and plane distance, static surfaces only; each 8x8 workgroup
    loads its 14x14 tile into workgroup memory once.
 4. **present** (fragment): bilinear upscale, ACES tone map, tracers (closest-approach glow, depth tested against the
-   trace), crosshair, stats overlay (3x5 bitmap font: FPS, ray-traced resolution and its % of the output;
-   `Scene.fps`, 0 hides it; plus samples per pixel), dither. **Raw mode** (`Renderer::set_raw`, key I) turns off
-   every smoothing step: nearest-neighbour upscale, no temporal accumulation, no spatial blur, no dither.
-   **Samples per pixel** (`Renderer::set_spp`, keys , and ., 1-16): the lighting (light picks, shadow rays,
-   bounce) is averaged over N samples of the same pixel-centre hit, so no AA is added. Raw walk scene at 0.5:
-   1 spp 5.6 ms, noise 0.097; 8 spp 34.7 ms, noise 0.058 (`shot --bench quick`). A per-sample firefly clamp made no
-   difference: the residual grain is ordinary variance, not rare outliers. Tracers and crosshair are drawn after tone mapping so they never enter history.
+   trace), crosshair, dither. Tracers and crosshair are drawn after tone mapping so they never enter history.
+5. **ui** (instanced quads, alpha blended, same render pass): HUD and settings panel from `ui.rs`, a 3x5 pixel
+   font (A-Z, 0-9, symbols) laid out on the CPU in output pixels. HUD (top left): FPS, ray-traced resolution and
+   its % of the output, samples per pixel, which smoothing is off. Esc releases the mouse and shows the settings
+   panel (samples and resolution -/+, raw and temporal on/off, resume); Esc again resumes.
+
+Display options (keys, or the settings panel):
+- **Raw pixels** (`Renderer::set_raw`, I): nearest-neighbour upscale, no spatial blur, no dither.
+- **Temporal accumulation** (`Renderer::set_temporal`, T, on by default): per-pixel reprojected history. Raw +
+  temporal gives accumulated, unblurred pixels; both off is the bare trace.
+- **Samples per pixel** (`Renderer::set_spp`, , and ., 1-16): the lighting (light picks, shadow rays, bounce) is
+  averaged over N samples of the same pixel-centre hit, so no AA is added. Raw walk scene at 0.5: 1 spp 5.6 ms,
+  noise 0.097; 8 spp 34.7 ms, noise 0.058 (`shot --bench quick`). A per-sample firefly clamp made no difference:
+  the residual grain is ordinary variance, not rare outliers.
 
 Performance (M2, 1280x720, `shot --bench`): trace is most of the frame. Shadow rays used to walk a body's ~65
 spheres and cost ~70% of trace; spheres no longer cast shadows, which removed that (and brightens the scene, as
@@ -150,7 +158,7 @@ yaw fix, and real GPU performance of the tracer.
 cargo test                                  # sim tests
 cargo clippy --all-targets
 cargo run --release --bin swarmpf           # play
-cargo run --release --bin shot -- out 0.5   # writes out_walk/walk_raw/swarm/fire/aftermath/shotgun/gap/past_gap.png
+cargo run --release --bin shot -- out 0.5   # writes out_walk/walk_raw/walk_raw8/walk_raw_temporal/settings/swarm/fire/aftermath/shotgun/gap/past_gap.png
 cargo run --release --bin shot -- --bench   # GPU ms per pass, mean brightness (bias check), frame-to-frame noise
 cargo run --release --bin shot -- --bench quick  # only the raw walk scene at 1 and 8 samples per pixel
 cargo run --release -p sim --example bench  # physics us/tick and a position checksum (must not change on refactors)

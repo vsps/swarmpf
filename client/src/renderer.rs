@@ -4,6 +4,7 @@
 //! from the spheres plus one diffuse bounce. See `shader.wgsl` for the passes.
 
 use crate::camera::{Camera, Mat4};
+use crate::ui::UiInst;
 use bytemuck::{Pod, Zeroable};
 
 /// One sphere. `emit` is rgb radiance (>1 is fine) with `a` = diffuse albedo.
@@ -122,8 +123,8 @@ pub struct Scene {
     pub tracers: Vec<TracerInst>,
     pub hit_flash: f32,
     pub exposure: f32,
-    /// Frames per second shown in the top-left corner; 0 hides the counter.
-    pub fps: f32,
+    /// HUD and menu quads, drawn over the image.
+    pub ui: Vec<UiInst>,
 }
 
 struct Growable {
@@ -164,10 +165,12 @@ pub struct Renderer {
     timing: Option<Timing>,
     /// Raw pixels: nearest-neighbour upscale, no temporal accumulation, spatial blur or dither.
     raw: bool,
+    /// Temporal accumulation (per-pixel history across frames; no spatial filtering).
+    accumulate: bool,
     /// Lighting samples per pixel (`MAX_SPP` at most).
     spp: u32,
     /// Cached per frame parity; cleared when a buffer they point at is replaced.
-    bind_groups: [Option<[wgpu::BindGroup; 4]>; 2],
+    bind_groups: [Option<[wgpu::BindGroup; 5]>; 2],
     device: wgpu::Device,
     queue: wgpu::Queue,
     srgb: bool,
@@ -187,6 +190,8 @@ pub struct Renderer {
     temporal: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
     spatial: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
     present: (wgpu::RenderPipeline, wgpu::BindGroupLayout),
+    ui_pipe: (wgpu::RenderPipeline, wgpu::BindGroupLayout),
+    ui: Growable,
 }
 
 fn storage(device: &wgpu::Device, label: &str, size: u64) -> Growable {
@@ -395,6 +400,44 @@ impl Renderer {
             cache: None,
         });
 
+        // HUD / menu quads: instanced, alpha blended over the presented image.
+        let ubgl = layout(
+            &device,
+            "ui",
+            wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            &[(0, Uniform), (20, Ro)],
+        );
+        let upl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ui"),
+            bind_group_layouts: &[Some(&ubgl)],
+            immediate_size: 0,
+        });
+        let upipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ui"),
+            layout: Some(&upl),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_ui"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_ui"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: std::mem::size_of::<Globals>() as u64,
@@ -419,8 +462,11 @@ impl Renderer {
             temporal,
             spatial,
             present: (ppipe, pbgl),
+            ui_pipe: (upipe, ubgl),
+            ui: storage(&device, "ui", 1 << 14),
             timing: None,
             raw: false,
+            accumulate: true,
             spp: 1,
             bind_groups: [None, None],
             device,
@@ -508,8 +554,8 @@ impl Renderer {
         self.scale
     }
 
-    /// Turn every smoothing step off (or back on): nearest-neighbour upscale, no temporal
-    /// accumulation, no spatial blur, no dither. The image shows the raw ray-traced pixels.
+    /// Raw pixels on (or off): nearest-neighbour upscale, no spatial blur, no dither. Temporal
+    /// accumulation is separate (`set_temporal`); with both off the image is the bare trace.
     pub fn set_raw(&mut self, raw: bool) {
         self.raw = raw;
         self.prev = None; // history from the other mode does not apply
@@ -517,6 +563,25 @@ impl Renderer {
 
     pub fn raw(&self) -> bool {
         self.raw
+    }
+
+    /// Blend each pixel with its reprojected history across frames (on by default).
+    pub fn set_temporal(&mut self, on: bool) {
+        self.accumulate = on;
+        self.prev = None;
+    }
+
+    pub fn temporal(&self) -> bool {
+        self.accumulate
+    }
+
+    /// Ray-traced resolution and output resolution, in pixels.
+    pub fn trace_size(&self) -> (u32, u32) {
+        (self.fbuf.tw, self.fbuf.th)
+    }
+
+    pub fn output_size(&self) -> (u32, u32) {
+        self.out
     }
 
     /// Lighting samples per pixel: noise falls as 1 / sqrt(spp), trace cost grows about linearly.
@@ -556,7 +621,7 @@ impl Renderer {
 
     /// Bind groups for the trace, temporal, spatial and present passes of frames with parity
     /// `cur` (the history buffers swap roles every frame).
-    fn make_bind_groups(&self, cur: usize) -> [wgpu::BindGroup; 4] {
+    fn make_bind_groups(&self, cur: usize) -> [wgpu::BindGroup; 5] {
         let prv = 1 - cur;
         let d = &self.device;
         let f = &self.fbuf;
@@ -610,6 +675,11 @@ impl Renderer {
                     (17, &self.tracers.buf),
                 ],
             ),
+            bind(
+                d,
+                &self.ui_pipe.1,
+                &[(0, &self.globals), (20, &self.ui.buf)],
+            ),
         ]
     }
 
@@ -644,13 +714,13 @@ impl Renderer {
                 scene.boxes.len() as u32,
                 scene.tracers.len() as u32,
             ],
-            params: [
-                self.frame_no as f32,
-                scene.exposure,
-                scene.hit_flash,
-                scene.fps,
+            params: [self.frame_no as f32, scene.exposure, scene.hit_flash, 0.0],
+            flags: [
+                self.srgb as u32,
+                self.raw as u32,
+                self.spp,
+                self.accumulate as u32,
             ],
-            flags: [self.srgb as u32, self.raw as u32, self.spp, 0],
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
@@ -659,7 +729,8 @@ impl Renderer {
             | Self::upload(d, q, &mut self.boxes, &scene.boxes)
             | Self::upload(d, q, &mut self.groups, &groups)
             | Self::upload(d, q, &mut self.cdf, &cdf)
-            | Self::upload(d, q, &mut self.tracers, &scene.tracers);
+            | Self::upload(d, q, &mut self.tracers, &scene.tracers)
+            | Self::upload(d, q, &mut self.ui, &scene.ui);
         if grown {
             self.bind_groups = [None, None];
         }
@@ -668,7 +739,7 @@ impl Renderer {
         if self.bind_groups[cur].is_none() {
             self.bind_groups[cur] = Some(self.make_bind_groups(cur));
         }
-        let [trace_bg, temporal_bg, spatial_bg, present_bg] =
+        let [trace_bg, temporal_bg, spatial_bg, present_bg, ui_bg] =
             self.bind_groups[cur].as_ref().unwrap();
         let d = &self.device;
         let f = &self.fbuf;
@@ -727,6 +798,11 @@ impl Renderer {
             pass.set_pipeline(&self.present.0);
             pass.set_bind_group(0, present_bg, &[]);
             pass.draw(0..3, 0..1);
+            if !scene.ui.is_empty() {
+                pass.set_pipeline(&self.ui_pipe.0);
+                pass.set_bind_group(0, ui_bg, &[]);
+                pass.draw(0..6, 0..scene.ui.len() as u32);
+            }
         }
         if let Some(t) = &self.timing {
             enc.resolve_query_set(&t.set, 0..8, &t.resolve, 0);

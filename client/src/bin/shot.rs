@@ -1,9 +1,10 @@
 //! Headless renderer: runs a scripted scenario and writes PNG screenshots.
-//! Usage: shot <out_prefix> [trace_scale]   writes walk, walk_raw, walk_raw8, swarm, fire, aftermath, shotgun, gap, past_gap
+//! Usage: shot <out_prefix> [trace_scale]   writes walk, walk_raw, walk_raw8, walk_raw_temporal, settings, swarm, fire, aftermath, shotgun, gap, past_gap
 //!        shot --bench        GPU ms per pass and mean image brightness, at trace scale 0.5 and 1.0
 
 use client::game::Game;
 use client::renderer::{Renderer, PASSES};
+use client::ui::{self, Ui};
 use sim::player::Input;
 
 const W: u32 = 1280;
@@ -61,7 +62,20 @@ fn main() {
             renderer.render(&view, &scene);
         }
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        scene.fps = WARMUP as f32 / t0.elapsed().as_secs_f32();
+        let st = ui::Status {
+            fps: WARMUP as f32 / t0.elapsed().as_secs_f32(),
+            trace: renderer.trace_size(),
+            output: renderer.output_size(),
+            spp: renderer.spp(),
+            raw: renderer.raw(),
+            temporal: renderer.temporal(),
+        };
+        let mut ui = Ui::default();
+        ui::hud(&mut ui, &st);
+        if name == "settings" {
+            ui::settings(&mut ui, &st, None);
+        }
+        scene.ui = ui.quads;
         renderer.render(&view, &scene);
         save(&device, &queue, &target, &format!("{prefix}_{name}.png"));
         eprintln!("wrote {prefix}_{name}.png");
@@ -88,12 +102,18 @@ fn main() {
     snap(&game, &mut renderer, "walk");
     // Same frame as raw pixels: no interpolation, accumulation, blur or dither.
     renderer.set_raw(true);
+    renderer.set_temporal(false);
     snap(&game, &mut renderer, "walk_raw");
     // Raw with 8 lighting samples per pixel: less noise, still no interpolation.
     renderer.set_spp(8);
     snap(&game, &mut renderer, "walk_raw8");
     renderer.set_spp(1);
+    // Raw pixels with temporal accumulation: per-pixel history, no blur.
+    renderer.set_temporal(true);
+    snap(&game, &mut renderer, "walk_raw_temporal");
     renderer.set_raw(false);
+    // The settings panel shown on Escape.
+    snap(&game, &mut renderer, "settings");
 
     // 2. Disperse.
     run(
@@ -252,6 +272,7 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue, quick: bool) {
         {
             let mut r = Renderer::new(device.clone(), queue.clone(), FORMAT, W, H, scale);
             r.set_raw(raw);
+            r.set_temporal(!raw);
             r.set_spp(spp);
             if !r.enable_timing() {
                 eprintln!("no timestamp queries on this adapter");

@@ -2,11 +2,13 @@
 //! WASD move, mouse look, Shift hold = disperse, LMB fire (rifle is automatic),
 //! 1/2/3 rifle / shotgun / railgun, V first/third person,
 //! [ and ] lower / raise the ray-trace resolution, , and . fewer / more lighting samples per pixel
-//! (1, 2, 4, 8, 16), I toggle raw pixels (no interpolation, AA or denoising), Esc release mouse.
-//! FPS, ray-traced resolution and samples per pixel show top left.
+//! (1, 2, 4, 8, 16), I toggle raw pixels (nearest upscale, no blur or dither), T toggle temporal
+//! accumulation. Esc releases the mouse and opens the settings panel (click its buttons); Esc
+//! again resumes. FPS, ray-traced resolution and samples per pixel show top left.
 
 use client::game::Game;
 use client::renderer::Renderer;
+use client::ui::{self, Action, Ui};
 use sim::player::Input;
 use std::sync::Arc;
 use std::time::Instant;
@@ -45,6 +47,9 @@ struct App {
     acc: f32,
     /// Smoothed frame time (s), for the FPS counter.
     frame_time: f32,
+    /// Cursor in window pixels, and the UI drawn last frame (for clicking its buttons).
+    cursor: Option<(f32, f32)>,
+    ui: Ui,
 }
 
 impl App {
@@ -60,6 +65,36 @@ impl App {
             }
             g.window.set_cursor_visible(!on);
             self.grabbed = on;
+        }
+    }
+
+    fn status(&self, r: &Renderer) -> ui::Status {
+        ui::Status {
+            fps: 1.0 / self.frame_time.max(1e-3),
+            trace: r.trace_size(),
+            output: r.output_size(),
+            spp: r.spp(),
+            raw: r.raw(),
+            temporal: r.temporal(),
+        }
+    }
+
+    /// Settings shared by the keys and the settings panel.
+    fn apply(&mut self, action: Action) {
+        if action == Action::Resume {
+            self.grab(true);
+            return;
+        }
+        let Some(g) = &mut self.gfx else { return };
+        let r = &mut g.renderer;
+        match action {
+            Action::SppDown => r.set_spp((r.spp() / 2).max(1)),
+            Action::SppUp => r.set_spp(r.spp() * 2),
+            Action::ScaleDown => r.set_scale(r.scale() - 0.125),
+            Action::ScaleUp => r.set_scale(r.scale() + 0.125),
+            Action::ToggleRaw => r.set_raw(!r.raw()),
+            Action::ToggleTemporal => r.set_temporal(!r.temporal()),
+            Action::Resume => {}
         }
     }
 
@@ -150,9 +185,16 @@ impl ApplicationHandler for App {
                 if self.grabbed {
                     self.game.trigger(down);
                 } else if down {
-                    self.grab(true);
+                    // Settings panel: click a button.
+                    if let Some(a) = self.cursor.and_then(|(x, y)| self.ui.hit(x, y)) {
+                        self.apply(a);
+                    }
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Some((position.x as f32, position.y as f32));
+            }
+            WindowEvent::CursorLeft { .. } => self.cursor = None,
             WindowEvent::KeyboardInput { event, .. } => {
                 let down = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -163,40 +205,20 @@ impl ApplicationHandler for App {
                         KeyCode::KeyD => self.keys.d = down,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys.shift = down,
                         KeyCode::Escape if down => {
-                            self.game.trigger(false);
-                            self.grab(false);
+                            if self.grabbed {
+                                self.game.trigger(false);
+                                self.grab(false);
+                            } else {
+                                self.grab(true);
+                            }
                         }
                         KeyCode::KeyV if down => self.game.third_person = !self.game.third_person,
-                        KeyCode::BracketLeft if down => {
-                            if let Some(g) = &mut self.gfx {
-                                let s = g.renderer.scale() - 0.125;
-                                g.renderer.set_scale(s);
-                            }
-                        }
-                        KeyCode::BracketRight if down => {
-                            if let Some(g) = &mut self.gfx {
-                                let s = g.renderer.scale() + 0.125;
-                                g.renderer.set_scale(s);
-                            }
-                        }
-                        KeyCode::Comma if down => {
-                            if let Some(g) = &mut self.gfx {
-                                let spp = (g.renderer.spp() / 2).max(1);
-                                g.renderer.set_spp(spp);
-                            }
-                        }
-                        KeyCode::Period if down => {
-                            if let Some(g) = &mut self.gfx {
-                                let spp = g.renderer.spp() * 2;
-                                g.renderer.set_spp(spp);
-                            }
-                        }
-                        KeyCode::KeyI if down => {
-                            if let Some(g) = &mut self.gfx {
-                                let raw = !g.renderer.raw();
-                                g.renderer.set_raw(raw);
-                            }
-                        }
+                        KeyCode::BracketLeft if down => self.apply(Action::ScaleDown),
+                        KeyCode::BracketRight if down => self.apply(Action::ScaleUp),
+                        KeyCode::Comma if down => self.apply(Action::SppDown),
+                        KeyCode::Period if down => self.apply(Action::SppUp),
+                        KeyCode::KeyI if down => self.apply(Action::ToggleRaw),
+                        KeyCode::KeyT if down => self.apply(Action::ToggleTemporal),
                         KeyCode::Digit1 if down => self.game.cycle_weapon(0),
                         KeyCode::Digit2 if down => self.game.cycle_weapon(1),
                         KeyCode::Digit3 if down => self.game.cycle_weapon(2),
@@ -217,7 +239,16 @@ impl ApplicationHandler for App {
                 }
                 let status = self.game.status();
                 let mut scene = self.game.scene();
-                scene.fps = 1.0 / self.frame_time.max(1e-3);
+                if let Some(g) = &self.gfx {
+                    let st = self.status(&g.renderer);
+                    let mut ui = Ui::default();
+                    ui::hud(&mut ui, &st);
+                    if !self.grabbed {
+                        ui::settings(&mut ui, &st, self.cursor);
+                    }
+                    scene.ui = std::mem::take(&mut ui.quads);
+                    self.ui = ui;
+                }
                 if let Some(g) = &mut self.gfx {
                     g.window.set_title(&status);
                     match g.surface.get_current_texture() {
@@ -252,6 +283,8 @@ fn main() {
         last: Instant::now(),
         acc: 0.0,
         frame_time: 1.0 / 60.0,
+        cursor: None,
+        ui: Ui::default(),
     };
     el.run_app(&mut app).unwrap();
 }
