@@ -121,6 +121,9 @@ pub struct Player {
     stun: Vec<f32>,
     time: f32,
     regen_timer: f32,
+    /// Per-tick scratch, kept to avoid allocating every tick.
+    snapshot: Vec<(Vec3, Vec3, f32, bool)>,
+    near: Vec<usize>,
 }
 
 impl Player {
@@ -198,6 +201,8 @@ impl Player {
             stun: vec![0.0; NUM_SLOTS],
             time: 0.0,
             regen_timer: 0.0,
+            snapshot: Vec::new(),
+            near: Vec::new(),
         };
         p.refresh_targets();
         for i in 0..p.elems.len() {
@@ -410,11 +415,9 @@ impl Player {
         let t = self.time;
 
         // Neighbour accelerations read the frame-start positions.
-        let snapshot: Vec<(Vec3, Vec3, f32, bool)> = self
-            .elems
-            .iter()
-            .map(|e| (e.pos, e.vel, e.r, e.alive()))
-            .collect();
+        let mut snapshot = std::mem::take(&mut self.snapshot);
+        snapshot.clear();
+        snapshot.extend(self.elems.iter().map(|e| (e.pos, e.vel, e.r, e.alive())));
 
         for i in 0..self.elems.len() {
             if !snapshot[i].3 {
@@ -488,9 +491,11 @@ impl Player {
             e.vel = (v + a * dt).clamp_len(MAX_SPEED_BODY * w_c + MAX_SPEED_SWARM * w_d);
             e.pos = p + e.vel * dt;
         }
+        self.snapshot = snapshot;
         self.collide_elements();
+        self.find_near_boxes(world);
         for e in self.elems.iter_mut().filter(|e| e.alive()) {
-            let n = world.push_sphere(&mut e.pos, e.r);
+            let n = world.push_sphere_among(self.near.iter().copied(), &mut e.pos, e.r);
             if n != Vec3::ZERO {
                 let n = n.normalized();
                 let vn = e.vel.dot(n);
@@ -499,6 +504,19 @@ impl Player {
                 }
             }
         }
+    }
+
+    /// Boxes near any live sphere, padded well past a sphere radius so that being pushed out of
+    /// one box never brings a sphere to a box that was left out.
+    fn find_near_boxes(&mut self, world: &World) {
+        let mut lo = v3(f32::MAX, f32::MAX, f32::MAX);
+        let mut hi = v3(f32::MIN, f32::MIN, f32::MIN);
+        for e in self.elems.iter().filter(|e| e.alive()) {
+            lo = v3(lo.x.min(e.pos.x), lo.y.min(e.pos.y), lo.z.min(e.pos.z));
+            hi = v3(hi.x.max(e.pos.x), hi.y.max(e.pos.y), hi.z.max(e.pos.z));
+        }
+        let pad = v3(1.0, 1.0, 1.0);
+        world.boxes_near(lo - pad, hi + pad, &mut self.near);
     }
 
     /// Spheres of one swarm bump into each other, so a hit sphere knocks its neighbours.
@@ -519,6 +537,10 @@ impl Player {
                 let d = b.pos - a.pos;
                 let d2 = d.len2();
                 let touch = a.r + b.r;
+                // Contact distance never exceeds touch: skip far pairs before any square root.
+                if d2 >= touch * touch {
+                    continue;
+                }
                 let rest = (self.targets[j] - self.targets[i]).len() * CONTACT_SLACK;
                 let coherent = touch.min(rest);
                 let contact = coherent + (touch - coherent) * w_d;
@@ -569,7 +591,10 @@ impl Player {
         for e in self.elems.iter_mut().filter(|e| e.alive()) {
             e.vel.y -= 9.8 * dt;
             e.pos += e.vel * dt;
-            let n = world.push_sphere(&mut e.pos, e.r);
+        }
+        self.find_near_boxes(world);
+        for e in self.elems.iter_mut().filter(|e| e.alive()) {
+            let n = world.push_sphere_among(self.near.iter().copied(), &mut e.pos, e.r);
             if n != Vec3::ZERO {
                 let n = n.normalized();
                 let vn = e.vel.dot(n);

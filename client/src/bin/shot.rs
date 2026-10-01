@@ -1,8 +1,9 @@
 //! Headless renderer: runs a scripted scenario and writes PNG screenshots.
 //! Usage: shot <out_prefix> [trace_scale]
+//!        shot --bench        GPU ms per pass and mean image brightness, at trace scale 0.5 and 1.0
 
 use client::game::Game;
-use client::renderer::Renderer;
+use client::renderer::{Renderer, PASSES};
 use sim::player::Input;
 
 const W: u32 = 1280;
@@ -23,9 +24,16 @@ fn main() {
     }))
     .expect("no adapter");
     eprintln!("adapter: {}", adapter.get_info().name);
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-            .expect("device");
+    // Timestamp queries (for --bench) where the adapter has them.
+    let desc = wgpu::DeviceDescriptor {
+        required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
+        ..Default::default()
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(&desc)).expect("device");
+    if prefix == "--bench" {
+        bench(&device, &queue);
+        return;
+    }
     let mut renderer = Renderer::new(device.clone(), queue.clone(), FORMAT, W, H, scale);
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("target"),
@@ -176,7 +184,129 @@ fn main() {
     );
 }
 
+/// Time each pass on two scenes (coherent walk, dispersed swarm) at two trace scales, and print
+/// the mean brightness of the final image so a change to the light estimator can be checked
+/// for bias (noise averages out over the frame; the mean should not move).
+fn bench(device: &wgpu::Device, queue: &wgpu::Queue) {
+    const FRAMES: usize = 200;
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("target"),
+        size: wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut game = Game::new();
+    game.pitch = -0.1;
+    let tick = |game: &mut Game, secs: f32, input: Input| {
+        for _ in 0..(secs / sim::DT) as usize {
+            game.tick(input);
+        }
+    };
+    tick(&mut game, 1.0, Input::default());
+    let walk_in = Input {
+        forward: 1.0,
+        ..Default::default()
+    };
+    tick(&mut game, 1.2, walk_in);
+    let walk = game.scene();
+    tick(
+        &mut game,
+        1.5,
+        Input {
+            disperse: true,
+            ..Default::default()
+        },
+    );
+    let swarm = game.scene();
+
+    for scale in [0.5f32, 1.0] {
+        for (name, scene) in [("walk", &walk), ("swarm", &swarm)] {
+            let mut r = Renderer::new(device.clone(), queue.clone(), FORMAT, W, H, scale);
+            if !r.enable_timing() {
+                eprintln!("no timestamp queries on this adapter");
+                return;
+            }
+            let mut sum = [0.0f32; 4];
+            let mut lum = 0.0;
+            for f in 0..FRAMES + 20 {
+                r.render(&view, scene);
+                let t = r.timings().unwrap();
+                if f >= 20 {
+                    for (s, t) in sum.iter_mut().zip(t) {
+                        *s += t / FRAMES as f32;
+                    }
+                }
+                // Mean brightness over the last few frames.
+                if f >= FRAMES + 10 {
+                    lum += mean_linear(&read_pixels(device, queue, &target)) / 10.0;
+                }
+            }
+            // Noise: RMS difference between two consecutive frames of this static scene.
+            let fa = read_pixels(device, queue, &target);
+            r.render(&view, scene);
+            let fb = read_pixels(device, queue, &target);
+            let lin = |c: u8| (c as f32 / 255.0).powf(2.2);
+            let noise = (fa
+                .iter()
+                .zip(&fb)
+                .enumerate()
+                .filter(|(i, _)| i % 4 != 3)
+                .map(|(_, (&a, &b))| (lin(a) - lin(b)).powi(2))
+                .sum::<f32>()
+                / (fa.len() as f32 * 0.75))
+                .sqrt();
+            // Wall clock with frames pipelined as in the game (no per-frame readback).
+            let t0 = std::time::Instant::now();
+            for _ in 0..FRAMES {
+                r.render(&view, scene);
+            }
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let wall = t0.elapsed().as_secs_f32() * 1e3 / FRAMES as f32;
+            let parts: Vec<String> = PASSES
+                .iter()
+                .zip(sum)
+                .map(|(n, t)| format!("{n} {t:.2}"))
+                .collect();
+            println!(
+                "scale {scale} {name:5}: {wall:.2} ms/frame | gpu {} | mean {lum:.4} noise {noise:.4}",
+                parts.join(", ")
+            );
+        }
+    }
+}
+
+/// Mean linear-light value of an sRGB RGBA8 image.
+fn mean_linear(px: &[u8]) -> f32 {
+    let lin = |c: u8| (c as f32 / 255.0).powf(2.2);
+    let n = px.len() / 4;
+    px.chunks(4)
+        .map(|p| (lin(p[0]) + lin(p[1]) + lin(p[2])) / 3.0)
+        .sum::<f32>()
+        / n as f32
+}
+
 fn save(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, path: &str) {
+    let pixels = read_pixels(device, queue, tex);
+    let file = std::fs::File::create(path).unwrap();
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), W, H);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .unwrap()
+        .write_image_data(&pixels)
+        .unwrap();
+}
+
+fn read_pixels(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture) -> Vec<u8> {
     let bpr = (W * 4).next_multiple_of(256);
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
@@ -210,12 +340,5 @@ fn save(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, path: &
     for row in 0..H as usize {
         pixels.extend_from_slice(&data[row * bpr as usize..row * bpr as usize + (W * 4) as usize]);
     }
-    let file = std::fs::File::create(path).unwrap();
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), W, H);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.write_header()
-        .unwrap()
-        .write_image_data(&pixels)
-        .unwrap();
+    pixels
 }

@@ -56,12 +56,38 @@ impl World {
     /// Push a sphere out of the level. Returns the summed contact normals
     /// (zero if no contact) so callers can slide velocity along surfaces.
     pub fn push_sphere(&self, p: &mut Vec3, r: f32) -> Vec3 {
+        self.push_sphere_among(0..self.boxes.len(), p, r)
+    }
+
+    /// Indices of the boxes that overlap the region `lo..hi`, in level order, into `out`.
+    /// A broad phase: a swarm tests only these instead of every box.
+    pub fn boxes_near(&self, lo: Vec3, hi: Vec3, out: &mut Vec<usize>) {
+        out.clear();
+        out.extend(self.boxes.iter().enumerate().filter_map(|(i, b)| {
+            let apart = b.min.x > hi.x
+                || b.max.x < lo.x
+                || b.min.y > hi.y
+                || b.max.y < lo.y
+                || b.min.z > hi.z
+                || b.max.z < lo.z;
+            (!apart).then_some(i)
+        }));
+    }
+
+    /// `push_sphere` against only the given boxes (the floor always counts). With the boxes
+    /// from `boxes_near` for a region the sphere stays inside, the result is identical.
+    pub fn push_sphere_among(
+        &self,
+        near: impl IntoIterator<Item = usize>,
+        p: &mut Vec3,
+        r: f32,
+    ) -> Vec3 {
         let mut n_sum = Vec3::ZERO;
         if p.y < r {
             p.y = r;
             n_sum += Vec3::Y;
         }
-        for b in &self.boxes {
+        for b in near.into_iter().map(|i| &self.boxes[i]) {
             let c = b.closest_point(*p);
             let d = *p - c;
             let d2 = d.len2();

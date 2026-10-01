@@ -76,21 +76,30 @@ client/   wgpu renderer + local game
 Passes (all in `shader.wgsl`):
 
 1. **trace** (compute): primary ray per pixel at `TRACE_SCALE` (default 0.5) of window size. Surfaces get direct
-   light from sphere emitters via weighted reservoir sampling (weight ~ `lum * r^2 * cos / d^2`, two picks, shadow ray
-   to a random point on the light's disc) plus one cosine-sampled bounce with the same direct-light estimator at
-   the bounce point. Spheres are flat shaded: one colour each, compressed emission (`EMITTER_DISPLAY`).
+   light from sphere emitters via weighted reservoir sampling (two picks, shadow ray to a random point on the
+   light's disc) plus one cosine-sampled bounce with the same direct-light estimator at the bounce point. Light
+   selection is hybrid (`direct_light`): a player within `NEAR_K` bounding radii enters sphere by sphere with the
+   exact weight `lum * r^2 * cos / d^2`; a farther player enters as one entry (power from its centre) and, if
+   picked, a sphere is chosen by RIS (`RIS_M` candidates from the per-player power CDF built in
+   `renderer.rs::build_accel`). Unbiased, same noise as the plain per-light loop, ~30% cheaper. Spheres are flat shaded: one colour each, compressed emission (`EMITTER_DISPLAY`).
 2. **temporal** (compute): reproject static surfaces with the previous view-proj, validate by id / normal / depth,
    blend with history count capped at 6 (lights move every frame, so long history smears).
-3. **spatial** (compute): 7x7 bilateral on normals and plane distance, static surfaces only.
+3. **spatial** (compute): 7x7 bilateral on normals and plane distance, static surfaces only; each 8x8 workgroup
+   loads its 14x14 tile into workgroup memory once.
 4. **present** (fragment): bilinear upscale, ACES tone map, tracers (closest-approach glow, depth tested against the
    trace), crosshair, FPS counter (3x5 bitmap font, `Scene.fps`, 0 hides it), dither. Tracers and crosshair are drawn after tone mapping so they never enter history.
+
+Performance (M2, 1280x720, `shot --bench`): trace is ~85% of the frame, and most of it is shadow rays walking a
+body's ~65 spheres (half the light is blocked by the body's own outer shell). Tried without gain: per-player
+sphere clusters (2-level BVH), loading only `pos_r`, largest-first sphere order, a single `direct_light` call site.
+On Apple GPUs the present pass's timestamps overlap the compute passes; trust the wall-clock ms/frame.
 
 There is no sky, ambient or fill light. Floor and ceiling boxes exist purely so light has something to bounce off.
 Tuning knobs: `EMIT` / `CORE_EMIT` in `game.rs`, `exposure` in the scene, `EMITTER_DISPLAY`, history cap, `TRACE_SCALE`.
 
 ## Status
 
-Done and tested (15 sim tests): sphere swarm, hp model, core, hitscan with penetration and wall blocking, humanoid rig
+Done and tested (16 sim tests): sphere swarm, hp model, core, hitscan with penetration and wall blocking, humanoid rig
 and walk cycle, boid dispersal, gap filtering and no re-forming inside walls, debris.
 Done and checked only through headless screenshots: ray tracer, third-person camera, tracers, crosshair, hit flash.
 **Not yet run on real hardware**: the interactive window (mouse grab, vsync, resize, `[` / `]` scale keys), the mouse
@@ -99,8 +108,8 @@ yaw fix, and real GPU performance of the tracer.
 ## Next steps
 
 1. **Play-test on a GPU.** Frame rate at scale 0.5 and 1.0; mouse feel; is the darkness right; is the noise
-   acceptable. If slow: add a uniform grid (cell `2*r_max`, CPU-built counting sort) for spheres, or reduce
-   reservoir picks, or cut the bounce.
+   acceptable. If slow: shadow rays against body spheres dominate; options that change the look are fewer
+   reservoir picks, no shadow ray at the bounce, or a lower default trace scale.
 2. **Lag-compensation history** for hitscan (about 250 ms of element positions) in `sim`.
 3. **Networking (on hold, by request).** `server/` authoritative at 60 Hz, snapshots 20-30 Hz over UDP
    (`renet` or `quinn` datagrams), client prediction for the local body, interpolation for others.
@@ -134,4 +143,6 @@ cargo test                                  # sim tests
 cargo clippy --all-targets
 cargo run --release --bin swarmpf           # play
 cargo run --release --bin shot -- out 0.5   # writes out_walk/swarm/fire/aftermath/shotgun/gap/past_gap.png
+cargo run --release --bin shot -- --bench   # GPU ms per pass, mean brightness (bias check), frame-to-frame noise
+cargo run --release -p sim --example bench  # physics us/tick and a position checksum (must not change on refactors)
 ```

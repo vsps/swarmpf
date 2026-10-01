@@ -29,6 +29,7 @@ struct BoxInst {
 struct Group {
     bound: vec4<f32>,   // bounding sphere of one player's spheres
     range: vec4<u32>,   // first sphere, count
+    light: vec4<f32>,   // x: light power, sum of luminance * r^2
 };
 struct Tracer {
     a: vec4<f32>,       // xyz start, w width
@@ -54,6 +55,8 @@ struct Tracer {
 @group(0) @binding(15) var<storage, read_write> fin_out: array<vec4<f32>>;
 @group(0) @binding(16) var<storage, read> fin_in: array<vec4<f32>>;
 @group(0) @binding(17) var<storage, read> tracers: array<Tracer>;
+// Per sphere: running fraction of its group's light power (see renderer.rs).
+@group(0) @binding(18) var<storage, read> cdf: array<f32>;
 
 const PI: f32 = 3.14159265;
 const NO_SPHERE: u32 = 0xffffffffu;
@@ -82,9 +85,13 @@ fn luminance(c: vec3<f32>) -> f32 {
 
 // ---------------------------------------------------------------- geometry
 
-fn ray_box(o: vec3<f32>, d: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec4<f32> {
-    let safe = select(d, vec3<f32>(1.0e-8), abs(d) < vec3<f32>(1.0e-8));
-    let inv = 1.0 / safe;
+// Reciprocal of a ray direction, with near-zero components nudged so it stays finite.
+// Computed once per ray and shared by every box test.
+fn inv_dir(d: vec3<f32>) -> vec3<f32> {
+    return 1.0 / select(d, vec3<f32>(1.0e-8), abs(d) < vec3<f32>(1.0e-8));
+}
+
+fn ray_box(o: vec3<f32>, inv: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec4<f32> {
     let t0 = (bmin - o) * inv;
     let t1 = (bmax - o) * inv;
     let tmn = min(t0, t1);
@@ -96,11 +103,11 @@ fn ray_box(o: vec3<f32>, d: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec4
     }
     var n = vec3<f32>(0.0);
     if (te == tmn.x) {
-        n.x = -sign(safe.x);
+        n.x = -sign(inv.x);
     } else if (te == tmn.y) {
-        n.y = -sign(safe.y);
+        n.y = -sign(inv.y);
     } else {
-        n.z = -sign(safe.z);
+        n.z = -sign(inv.z);
     }
     return vec4<f32>(te, n);
 }
@@ -144,8 +151,9 @@ fn trace(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Hit {
     h.kind = 0u;
     h.idx = 0u;
     h.n = vec3<f32>(0.0);
+    let inv = inv_dir(d);
     for (var i = 0u; i < g.counts.z; i++) {
-        let r = ray_box(o, d, boxes[i].bmin.xyz, boxes[i].bmax.xyz);
+        let r = ray_box(o, inv, boxes[i].bmin.xyz, boxes[i].bmax.xyz);
         if (r.x > 1.0e-4 && r.x < h.t) {
             h.t = r.x;
             h.kind = 1u;
@@ -160,13 +168,14 @@ fn trace(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Hit {
         }
         for (var k = 0u; k < gr.range.y; k++) {
             let si = gr.range.x + k;
-            let s = spheres[si];
-            let t = ray_sphere_t(o, d, s.pos_r.xyz, s.pos_r.w);
+            // Only position and radius: half the bytes of a whole `Sphere`.
+            let pr = spheres[si].pos_r;
+            let t = ray_sphere_t(o, d, pr.xyz, pr.w);
             if (t > 1.0e-4 && t < h.t) {
                 h.t = t;
                 h.kind = 2u;
                 h.idx = si;
-                h.n = (o + d * t - s.pos_r.xyz) / s.pos_r.w;
+                h.n = (o + d * t - pr.xyz) / pr.w;
             }
         }
     }
@@ -174,8 +183,9 @@ fn trace(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Hit {
 }
 
 fn occluded(o: vec3<f32>, d: vec3<f32>, tmax: f32, ignore: u32) -> bool {
+    let inv = inv_dir(d);
     for (var i = 0u; i < g.counts.z; i++) {
-        let r = ray_box(o, d, boxes[i].bmin.xyz, boxes[i].bmax.xyz);
+        let r = ray_box(o, inv, boxes[i].bmin.xyz, boxes[i].bmax.xyz);
         if (r.x > 1.0e-4 && r.x < tmax) {
             return true;
         }
@@ -190,8 +200,8 @@ fn occluded(o: vec3<f32>, d: vec3<f32>, tmax: f32, ignore: u32) -> bool {
             if (si == ignore) {
                 continue;
             }
-            let s = spheres[si];
-            let t = ray_sphere_t(o, d, s.pos_r.xyz, s.pos_r.w);
+            let pr = spheres[si].pos_r;
+            let t = ray_sphere_t(o, d, pr.xyz, pr.w);
             if (t > 1.0e-4 && t < tmax) {
                 return true;
             }
@@ -202,36 +212,102 @@ fn occluded(o: vec3<f32>, d: vec3<f32>, tmax: f32, ignore: u32) -> bool {
 
 // ---------------------------------------------------------------- lighting
 
-// Direct light at a surface point from the sphere emitters. Lights are picked by weighted
-// reservoir sampling with weight ~ luminance * r^2 * cos / d^2, then a shadow ray is traced to
-// a random point on the light. `ignore` is a sphere index that must not light or block itself.
+// Direct light at a surface point from the sphere emitters, by weighted reservoir sampling over
+// "entries" so the cost does not grow with every sphere in the level:
+//  - a player near p (within NEAR_K of its bounding radius) enters sphere by sphere with the exact
+//    weight lum * r^2 * cos / d^2, as a plain per-light loop would;
+//  - a player further away enters as one entry with an estimated weight ~ power * cos / d^2 from
+//    its centre, floored by a cone bound so it is never zero where any of its spheres could light
+//    p (keeping the estimate unbiased). When picked, a sphere within it is chosen by resampled
+//    importance sampling: RIS_M candidates drawn by power from the group's CDF, one kept in
+//    proportion to its real cos / d^2 term. From afar a body's spheres all look alike, so this
+//    is nearly as good as the exact loop at a fraction of the cost.
+// Two independent picks, a shadow ray each to a random point on the light's disc. `ignore` is a
+// sphere index that must not light or block itself.
+const NEAR_K: f32 = 2.5;
+// Picks with this bit set name a whole group (far player) rather than a sphere.
+const GROUP_BIT: u32 = 0x80000000u;
+const RIS_M: u32 = 4u;
+
+// Index of the first sphere in [start, start + n) whose CDF value reaches u.
+fn pick_by_power(start: u32, n: u32, u: f32) -> u32 {
+    var lo = start;
+    var hi = start + n - 1u;
+    while (lo < hi) {
+        let mid = (lo + hi) / 2u;
+        if (cdf[mid] < u) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// cos / d^2 term of a sphere light at p (0 if it faces away or is ignored).
+fn light_geo(p: vec3<f32>, n: vec3<f32>, si: u32, ignore: u32) -> f32 {
+    if (si == ignore) {
+        return 0.0;
+    }
+    let s = spheres[si];
+    if (luminance(s.emit.rgb) < 1.0e-3) {
+        return 0.0;
+    }
+    let l = s.pos_r.xyz - p;
+    let d2 = dot(l, l);
+    let r2 = s.pos_r.w * s.pos_r.w;
+    let cosn = max(dot(n, l * inverseSqrt(d2)), 0.0);
+    return cosn / max(d2, r2);
+}
+
 fn direct_light(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, ignore: u32) -> vec3<f32> {
     var wsum = 0.0;
     var sel0 = NO_SPHERE;
     var sel1 = NO_SPHERE;
     var w0 = 0.0;
     var w1 = 0.0;
-    for (var i = 0u; i < g.counts.x; i++) {
-        let s = spheres[i];
-        let lum = luminance(s.emit.rgb);
-        if (lum < 1.0e-3 || i == ignore) {
+    for (var gi = 0u; gi < g.counts.y; gi++) {
+        let gr = groups[gi];
+        let power = gr.light.x;
+        if (power <= 0.0) {
             continue;
         }
-        let l = s.pos_r.xyz - p;
-        let d2 = dot(l, l);
-        let r2 = s.pos_r.w * s.pos_r.w;
-        let cosn = max(dot(n, l * inverseSqrt(d2)), 0.0);
-        let w = lum * r2 * cosn / max(d2, r2);
+        let l = gr.bound.xyz - p;
+        let d = max(length(l), 1.0e-6);
+        let rad = gr.bound.w;
+        if (d < NEAR_K * rad) {
+            // Near: every sphere is its own entry, weighted exactly.
+            for (var si = gr.range.x; si < gr.range.x + gr.range.y; si++) {
+                let s = spheres[si];
+                let w = luminance(s.emit.rgb) * s.pos_r.w * s.pos_r.w * light_geo(p, n, si, ignore);
+                if (w <= 0.0) {
+                    continue;
+                }
+                wsum += w;
+                if (rand() * wsum < w) {
+                    sel0 = si;
+                    w0 = w;
+                }
+                if (rand() * wsum < w) {
+                    sel1 = si;
+                    w1 = w;
+                }
+            }
+            continue;
+        }
+        // Far: one entry for the whole player.
+        let cosb = min(max(dot(n, l) / d, 0.0) + rad / d, 1.0);
+        let w = power * max(max(dot(n, l) / d, 0.0), 0.1 * cosb) / (d * d);
         if (w <= 0.0) {
             continue;
         }
         wsum += w;
         if (rand() * wsum < w) {
-            sel0 = i;
+            sel0 = gi | GROUP_BIT;
             w0 = w;
         }
         if (rand() * wsum < w) {
-            sel1 = i;
+            sel1 = gi | GROUP_BIT;
             w1 = w;
         }
     }
@@ -241,7 +317,30 @@ fn direct_light(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, ignore: u32) -> v
         if (sel == NO_SPHERE) {
             continue;
         }
-        let s = spheres[sel];
+        let w_sel = select(w1, w0, k == 0);
+        var chosen = sel;
+        // Monte Carlo weight of this pick: f / pdf with the Le / lum factor applied below.
+        var weight = wsum;
+        if ((sel & GROUP_BIT) != 0u) {
+            // RIS within the group. Source pdf = lum r^2 / power, target = lum r^2 geo, so each
+            // candidate's resampling weight is power * geo.
+            let gr = groups[sel & ~GROUP_BIT];
+            chosen = NO_SPHERE;
+            var ris_sum = 0.0;
+            for (var m = 0u; m < RIS_M; m++) {
+                let si = pick_by_power(gr.range.x, gr.range.y, rand());
+                let wr = gr.light.x * light_geo(p, n, si, ignore);
+                ris_sum += wr;
+                if (wr > 0.0 && rand() * ris_sum < wr) {
+                    chosen = si;
+                }
+            }
+            if (chosen == NO_SPHERE) {
+                continue;
+            }
+            weight = (ris_sum / f32(RIS_M)) * (wsum / w_sel);
+        }
+        let s = spheres[chosen];
         // Aim at a random point on the light's disc as seen from p (soft shadows).
         let to = s.pos_r.xyz - p;
         let dist = length(to);
@@ -256,11 +355,11 @@ fn direct_light(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, ignore: u32) -> v
         let dir_full = target_p - o;
         let dl = length(dir_full);
         let dir = dir_full / dl;
-        if (dot(dir, n) <= 0.0 || occluded(o, dir, dl - s.pos_r.w * 0.9, sel)) {
+        if (dot(dir, n) <= 0.0 || occluded(o, dir, dl - s.pos_r.w * 0.9, chosen)) {
             continue;
         }
         let le = s.emit.rgb;
-        result += albedo * (le / luminance(le)) * wsum;
+        result += albedo * (le / luminance(le)) * weight;
     }
     return result * 0.5;
 }
@@ -380,38 +479,68 @@ fn temporal_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     acc_out[idx] = out;
 }
 
+// The 7x7 filter reads each neighbour's normal, position and colour. An 8x8 workgroup shares
+// one 14x14 tile of them in workgroup memory, loaded once, instead of every thread reading its
+// 49 taps from storage.
+const TILE: u32 = 14u;
+var<workgroup> tile_n: array<vec4<f32>, 196>;
+var<workgroup> tile_p: array<vec4<f32>, 196>;
+var<workgroup> tile_c: array<vec4<f32>, 196>;
+
 @compute @workgroup_size(8, 8)
-fn spatial_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn spatial_main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let dim = vec2<i32>(g.dims.xy);
+    let origin = vec2<i32>(wid.xy * 8u) - vec2<i32>(3);
+    for (var k = lid.y * 8u + lid.x; k < TILE * TILE; k += 64u) {
+        let q = origin + vec2<i32>(i32(k % TILE), i32(k / TILE));
+        if (q.x < 0 || q.y < 0 || q.x >= dim.x || q.y >= dim.y) {
+            // Id 0 never matches a surface (box ids are negative), so it is skipped like before.
+            tile_n[k] = vec4<f32>(0.0);
+        } else {
+            let qi = u32(q.y * dim.x + q.x);
+            tile_n[k] = gnrm_r[qi];
+            tile_p[k] = gpos_r[qi];
+            tile_c[k] = acc_in[qi];
+        }
+    }
+    workgroupBarrier();
     if (gid.x >= g.dims.x || gid.y >= g.dims.y) {
         return;
     }
     let idx = gid.y * g.dims.x + gid.x;
-    let gn = gnrm_r[idx];
-    let gp = gpos_r[idx];
+    let centre = (lid.y + 3u) * TILE + lid.x + 3u;
+    let gn = tile_n[centre];
+    let gp = tile_p[centre];
     if (gn.w >= 0.0) {
-        fin_out[idx] = acc_in[idx];
+        fin_out[idx] = tile_c[centre];
         return;
     }
     var sum = vec3<f32>(0.0);
     var wsum = 0.0;
-    let ci = vec2<i32>(gid.xy);
-    let dim = vec2<i32>(g.dims.xy);
-    for (var dy = -3; dy <= 3; dy++) {
-        for (var dx = -3; dx <= 3; dx++) {
-            let q = ci + vec2<i32>(dx, dy);
-            if (q.x < 0 || q.y < 0 || q.x >= dim.x || q.y >= dim.y) {
-                continue;
-            }
-            let qi = u32(q.y * dim.x + q.x);
-            let qn = gnrm_r[qi];
+    let inv_plane = 1.0 / (0.02 * gp.w + 0.01);
+    for (var dy = 0u; dy < 7u; dy++) {
+        for (var dx = 0u; dx < 7u; dx++) {
+            let k = (lid.y + dy) * TILE + lid.x + dx;
+            let qn = tile_n[k];
             if (qn.w != gn.w) {
                 continue;
             }
-            let plane = abs(dot(gn.xyz, gpos_r[qi].xyz - gp.xyz));
-            let wgt = pow(max(dot(gn.xyz, qn.xyz), 0.0), 32.0)
-                * exp(-plane / (0.02 * gp.w + 0.01))
-                * exp(-f32(dx * dx + dy * dy) / 8.0);
-            sum += acc_in[qi].rgb * wgt;
+            let plane = abs(dot(gn.xyz, tile_p[k].xyz - gp.xyz));
+            // pow(cos, 32) by repeated squaring.
+            var c = max(dot(gn.xyz, qn.xyz), 0.0);
+            c *= c;
+            c *= c;
+            c *= c;
+            c *= c;
+            c *= c;
+            let ox = f32(dx) - 3.0;
+            let oy = f32(dy) - 3.0;
+            let wgt = c * exp(-plane * inv_plane - (ox * ox + oy * oy) / 8.0);
+            sum += tile_c[k].rgb * wgt;
             wsum += wgt;
         }
     }

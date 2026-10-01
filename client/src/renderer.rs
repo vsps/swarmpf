@@ -39,6 +39,63 @@ pub struct TracerInst {
 struct GroupGpu {
     bound: [f32; 4],
     range: [u32; 4],
+    /// x: light power of the group, sum of luminance * r^2 over its spheres.
+    light: [f32; 4],
+}
+
+/// Bounding sphere (centre, radius) of some spheres.
+fn bound_of(s: &[SphereInst]) -> [f32; 4] {
+    let n = s.len().max(1) as f32;
+    let mut ctr = [0.0f32; 3];
+    for e in s {
+        for (k, c) in ctr.iter_mut().enumerate() {
+            *c += e.pos_r[k] / n;
+        }
+    }
+    let r = s
+        .iter()
+        .map(|e| {
+            let d = [
+                e.pos_r[0] - ctr[0],
+                e.pos_r[1] - ctr[1],
+                e.pos_r[2] - ctr[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() + e.pos_r[3]
+        })
+        .fold(0.0f32, f32::max);
+    [ctr[0], ctr[1], ctr[2], r + 0.01]
+}
+
+/// Per-player bounding spheres (let rays skip whole swarms) and light power, and each group's
+/// light CDF (so the shader picks a sphere by power with a binary search instead of looping
+/// over every light).
+fn build_accel(scene: &Scene) -> (Vec<GroupGpu>, Vec<f32>) {
+    let luminance = |e: &[f32; 4]| 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2];
+    let mut groups = Vec::new();
+    let mut cdf = vec![0.0f32; scene.spheres.len()];
+    for &(start, n) in scene.groups.iter().filter(|&&(_, n)| n > 0) {
+        let first = start as usize;
+        let s = &scene.spheres[first..first + n as usize];
+        let mut acc = 0.0;
+        for (k, sp) in s.iter().enumerate() {
+            let lum = luminance(&sp.emit);
+            if lum >= 1e-3 {
+                acc += lum * sp.pos_r[3] * sp.pos_r[3];
+            }
+            cdf[first + k] = acc;
+        }
+        if acc > 0.0 {
+            for c in &mut cdf[first..first + s.len()] {
+                *c /= acc;
+            }
+        }
+        groups.push(GroupGpu {
+            bound: bound_of(s),
+            range: [start, n, 0, 0],
+            light: [acc, 0.0, 0.0, 0.0],
+        });
+    }
+    (groups, cdf)
 }
 
 #[repr(C)]
@@ -91,7 +148,20 @@ enum Kind {
     Rw,
 }
 
+/// GPU timestamps around each pass (needs `Features::TIMESTAMP_QUERY`).
+struct Timing {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+}
+
+/// Names of the timed passes, in the order `Renderer::timings` reports them.
+pub const PASSES: [&str; 4] = ["trace", "temporal", "spatial", "present"];
+
 pub struct Renderer {
+    timing: Option<Timing>,
+    /// Cached per frame parity; cleared when a buffer they point at is replaced.
+    bind_groups: [Option<[wgpu::BindGroup; 4]>; 2],
     device: wgpu::Device,
     queue: wgpu::Queue,
     srgb: bool,
@@ -103,6 +173,8 @@ pub struct Renderer {
     spheres: Growable,
     boxes: Growable,
     groups: Growable,
+    /// Per sphere: the running fraction of its group's light power (a CDF for picking lights).
+    cdf: Growable,
     tracers: Growable,
     fbuf: Frame,
     trace: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
@@ -260,6 +332,7 @@ impl Renderer {
                 (4, Rw),
                 (5, Rw),
                 (6, Rw),
+                (18, Ro),
             ],
         );
         let temporal = compute(
@@ -333,15 +406,77 @@ impl Renderer {
             spheres: storage(&device, "spheres", 1 << 14),
             boxes: storage(&device, "boxes", 1 << 12),
             groups: storage(&device, "groups", 1 << 10),
+            cdf: storage(&device, "cdf", 1 << 12),
             tracers: storage(&device, "tracers", 1 << 10),
             fbuf: make_frame(&device, tw, th),
             trace,
             temporal,
             spatial,
             present: (ppipe, pbgl),
+            timing: None,
+            bind_groups: [None, None],
             device,
             queue,
         }
+    }
+
+    /// Time every pass on the GPU from now on, if the device supports timestamp queries.
+    /// Returns whether timing is on.
+    pub fn enable_timing(&mut self) -> bool {
+        if !self
+            .device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
+        {
+            return false;
+        }
+        let n = PASSES.len() as u64 * 2;
+        let buf = |label, usage| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: n * 8,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        self.timing = Some(Timing {
+            set: self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("pass timing"),
+                ty: wgpu::QueryType::Timestamp,
+                count: n as u32,
+            }),
+            resolve: buf(
+                "timing resolve",
+                wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            ),
+            readback: buf(
+                "timing readback",
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            ),
+        });
+        true
+    }
+
+    /// Milliseconds each pass (see `PASSES`) took in the last `render`. Blocks until the GPU is
+    /// done, so only for benchmarks.
+    pub fn timings(&self) -> Option<[f32; 4]> {
+        let t = self.timing.as_ref()?;
+        let slice = t.readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let ticks: Vec<u64> = {
+            let data = slice.get_mapped_range().unwrap();
+            bytemuck::cast_slice(&data).to_vec()
+        };
+        t.readback.unmap();
+        let ns = self.queue.get_timestamp_period();
+        let mut out = [0.0f32; 4];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = ticks[2 * i + 1].saturating_sub(ticks[2 * i]) as f32 * ns * 1e-6;
+        }
+        Some(out)
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -369,16 +504,85 @@ impl Renderer {
         let (tw, th) = trace_dims(self.out, self.scale);
         self.fbuf = make_frame(&self.device, tw, th);
         self.prev = None; // history is gone
+        self.bind_groups = [None, None];
     }
 
-    fn upload<T: Pod>(device: &wgpu::Device, queue: &wgpu::Queue, g: &mut Growable, data: &[T]) {
+    /// Write `data` into `g`, growing it if needed. Returns true if the buffer was replaced
+    /// (so bind groups that point at it are stale).
+    fn upload<T: Pod>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        g: &mut Growable,
+        data: &[T],
+    ) -> bool {
         let bytes: &[u8] = bytemuck::cast_slice(data);
-        if bytes.len() as u64 > g.cap {
+        let grown = bytes.len() as u64 > g.cap;
+        if grown {
             *g = storage(device, "grown", (bytes.len() as u64).next_power_of_two());
         }
         if !bytes.is_empty() {
             queue.write_buffer(&g.buf, 0, bytes);
         }
+        grown
+    }
+
+    /// Bind groups for the trace, temporal, spatial and present passes of frames with parity
+    /// `cur` (the history buffers swap roles every frame).
+    fn make_bind_groups(&self, cur: usize) -> [wgpu::BindGroup; 4] {
+        let prv = 1 - cur;
+        let d = &self.device;
+        let f = &self.fbuf;
+        [
+            bind(
+                d,
+                &self.trace.1,
+                &[
+                    (0, &self.globals),
+                    (1, &self.spheres.buf),
+                    (2, &self.boxes.buf),
+                    (3, &self.groups.buf),
+                    (4, &f.rad),
+                    (5, &f.gpos[cur]),
+                    (6, &f.gnrm[cur]),
+                    (18, &self.cdf.buf),
+                ],
+            ),
+            bind(
+                d,
+                &self.temporal.1,
+                &[
+                    (0, &self.globals),
+                    (7, &f.rad),
+                    (8, &f.gpos[cur]),
+                    (9, &f.gnrm[cur]),
+                    (10, &f.gpos[prv]),
+                    (11, &f.gnrm[prv]),
+                    (12, &f.acc[prv]),
+                    (13, &f.acc[cur]),
+                ],
+            ),
+            bind(
+                d,
+                &self.spatial.1,
+                &[
+                    (0, &self.globals),
+                    (8, &f.gpos[cur]),
+                    (9, &f.gnrm[cur]),
+                    (14, &f.acc[cur]),
+                    (15, &f.fin),
+                ],
+            ),
+            bind(
+                d,
+                &self.present.1,
+                &[
+                    (0, &self.globals),
+                    (8, &f.gpos[cur]),
+                    (16, &f.fin),
+                    (17, &self.tracers.buf),
+                ],
+            ),
+        ]
     }
 
     pub fn render(&mut self, target: &wgpu::TextureView, scene: &Scene) {
@@ -390,36 +594,7 @@ impl Renderer {
         let tan_x = tan_y * aspect;
         let (prev_vp, prev_eye) = self.prev.unwrap_or((view_proj, c.eye));
 
-        // Per-player bounding spheres let rays skip whole swarms.
-        let groups: Vec<GroupGpu> = scene
-            .groups
-            .iter()
-            .filter(|&&(_, n)| n > 0)
-            .map(|&(start, n)| {
-                let s = &scene.spheres[start as usize..(start + n) as usize];
-                let mut ctr = [0.0f32; 3];
-                for e in s {
-                    for (k, c) in ctr.iter_mut().enumerate() {
-                        *c += e.pos_r[k] / n as f32;
-                    }
-                }
-                let r = s
-                    .iter()
-                    .map(|e| {
-                        let d = [
-                            e.pos_r[0] - ctr[0],
-                            e.pos_r[1] - ctr[1],
-                            e.pos_r[2] - ctr[2],
-                        ];
-                        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() + e.pos_r[3]
-                    })
-                    .fold(0.0f32, f32::max);
-                GroupGpu {
-                    bound: [ctr[0], ctr[1], ctr[2], r + 0.01],
-                    range: [start, n, 0, 0],
-                }
-            })
-            .collect();
+        let (groups, cdf) = build_accel(scene);
 
         let f = &self.fbuf;
         let globals = Globals {
@@ -451,79 +626,51 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
-        Self::upload(&self.device, &self.queue, &mut self.spheres, &scene.spheres);
-        Self::upload(&self.device, &self.queue, &mut self.boxes, &scene.boxes);
-        Self::upload(&self.device, &self.queue, &mut self.groups, &groups);
-        Self::upload(&self.device, &self.queue, &mut self.tracers, &scene.tracers);
+        let (d, q) = (&self.device, &self.queue);
+        let grown = Self::upload(d, q, &mut self.spheres, &scene.spheres)
+            | Self::upload(d, q, &mut self.boxes, &scene.boxes)
+            | Self::upload(d, q, &mut self.groups, &groups)
+            | Self::upload(d, q, &mut self.cdf, &cdf)
+            | Self::upload(d, q, &mut self.tracers, &scene.tracers);
+        if grown {
+            self.bind_groups = [None, None];
+        }
 
-        let (cur, prv) = (
-            (self.frame_no % 2) as usize,
-            ((self.frame_no + 1) % 2) as usize,
-        );
+        let cur = (self.frame_no % 2) as usize;
+        if self.bind_groups[cur].is_none() {
+            self.bind_groups[cur] = Some(self.make_bind_groups(cur));
+        }
+        let [trace_bg, temporal_bg, spatial_bg, present_bg] =
+            self.bind_groups[cur].as_ref().unwrap();
         let d = &self.device;
         let f = &self.fbuf;
-        let trace_bg = bind(
-            d,
-            &self.trace.1,
-            &[
-                (0, &self.globals),
-                (1, &self.spheres.buf),
-                (2, &self.boxes.buf),
-                (3, &self.groups.buf),
-                (4, &f.rad),
-                (5, &f.gpos[cur]),
-                (6, &f.gnrm[cur]),
-            ],
-        );
-        let temporal_bg = bind(
-            d,
-            &self.temporal.1,
-            &[
-                (0, &self.globals),
-                (7, &f.rad),
-                (8, &f.gpos[cur]),
-                (9, &f.gnrm[cur]),
-                (10, &f.gpos[prv]),
-                (11, &f.gnrm[prv]),
-                (12, &f.acc[prv]),
-                (13, &f.acc[cur]),
-            ],
-        );
-        let spatial_bg = bind(
-            d,
-            &self.spatial.1,
-            &[
-                (0, &self.globals),
-                (8, &f.gpos[cur]),
-                (9, &f.gnrm[cur]),
-                (14, &f.acc[cur]),
-                (15, &f.fin),
-            ],
-        );
-        let present_bg = bind(
-            d,
-            &self.present.1,
-            &[
-                (0, &self.globals),
-                (8, &f.gpos[cur]),
-                (16, &f.fin),
-                (17, &self.tracers.buf),
-            ],
-        );
-
         let (gx, gy) = (f.tw.div_ceil(8), f.th.div_ceil(8));
         let mut enc = d.create_command_encoder(&Default::default());
+        let ts = |i: u32| {
+            self.timing
+                .as_ref()
+                .map(|t| wgpu::ComputePassTimestampWrites {
+                    query_set: &t.set,
+                    beginning_of_pass_write_index: Some(2 * i),
+                    end_of_pass_write_index: Some(2 * i + 1),
+                })
+        };
+        // One pass per stage so each can be timed; the compute passes are otherwise identical.
+        for (i, (pipe, bg)) in [
+            (&self.trace.0, trace_bg),
+            (&self.temporal.0, temporal_bg),
+            (&self.spatial.0, spatial_bg),
+        ]
+        .into_iter()
+        .enumerate()
         {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            for (pipe, bg) in [
-                (&self.trace.0, &trace_bg),
-                (&self.temporal.0, &temporal_bg),
-                (&self.spatial.0, &spatial_bg),
-            ] {
-                pass.set_pipeline(pipe);
-                pass.set_bind_group(0, bg, &[]);
-                pass.dispatch_workgroups(gx, gy, 1);
-            }
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(PASSES[i]),
+                timestamp_writes: ts(i as u32),
+            });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(gx, gy, 1);
         }
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -538,13 +685,24 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self
+                    .timing
+                    .as_ref()
+                    .map(|t| wgpu::RenderPassTimestampWrites {
+                        query_set: &t.set,
+                        beginning_of_pass_write_index: Some(6),
+                        end_of_pass_write_index: Some(7),
+                    }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.present.0);
-            pass.set_bind_group(0, &present_bg, &[]);
+            pass.set_bind_group(0, present_bg, &[]);
             pass.draw(0..3, 0..1);
+        }
+        if let Some(t) = &self.timing {
+            enc.resolve_query_set(&t.set, 0..8, &t.resolve, 0);
+            enc.copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, 64);
         }
         self.queue.submit([enc.finish()]);
         self.prev = Some((view_proj, c.eye));
