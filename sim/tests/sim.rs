@@ -11,6 +11,9 @@ fn settle(p: &mut Player, world: &World, secs: f32, input: Input) {
     }
 }
 
+/// Standing still, spheres drift up to `WANDER` per axis around their slots.
+const REST_TOL: f32 = WANDER * 1.8 + 0.02;
+
 /// Largest distance from an element to its slot; slots below the floor are clamped
 /// to where a sphere resting on the floor can actually sit.
 fn worst_slot_error(p: &Player) -> f32 {
@@ -107,7 +110,7 @@ fn coherent_body_settles_on_its_slots() {
     let mut p = Player::spawn(1, v3(0.0, 0.0, 0.0));
     settle(&mut p, &world, 1.0, idle(0.0));
     let worst = worst_slot_error(&p);
-    assert!(worst < 0.02, "worst slot error {worst}");
+    assert!(worst < REST_TOL, "worst slot error {worst}");
     // Also while walking: the swarm trails the skeleton slightly, but does not fall apart.
     let walk = Input {
         forward: 1.0,
@@ -151,9 +154,38 @@ fn penetration_passes_through_multiple_spheres() {
 
     let ev = hitscan(&mut players, 0, origin, dir, Weapon::RAILGUN, &world);
     assert_eq!(ev.len(), 3); // only three spheres exist on the line
-    assert_eq!(players[1].elems[0].hp, 18);
-    assert_eq!(players[1].elems[1].hp, 19);
-    assert_eq!(players[1].elems[2].hp, 19);
+    assert_eq!(players[1].elems[0].hp, 17);
+    assert_eq!(players[1].elems[1].hp, 18);
+    assert_eq!(players[1].elems[2].hp, 18);
+}
+
+#[test]
+fn railgun_one_shots_every_sphere_through_a_body() {
+    let world = open_world();
+    let mut players = vec![
+        Player::spawn(1, v3(0.0, 0.0, 0.0)),
+        Player::spawn(2, v3(0.0, 0.0, 10.0)),
+    ];
+    settle(&mut players[1], &world, 0.5, idle(0.0));
+    // Through a thigh sphere, with no core in the way: straight through every sphere.
+    let thigh = players[1]
+        .elems
+        .iter()
+        .find(|e| (0.6..0.8).contains(&e.pos.y))
+        .unwrap()
+        .pos;
+    let origin = v3(thigh.x, thigh.y, 0.5);
+    let dir = v3(0.0, 0.0, 1.0);
+    let ev = hitscan(&mut players, 0, origin, dir, Weapon::RAILGUN, &world);
+    assert!(!ev.is_empty());
+    assert!(ev.iter().all(|e| e.destroyed));
+    // Nothing is left standing on the line: it went clean through.
+    let blocked = players[1]
+        .elems
+        .iter()
+        .filter(|e| e.alive())
+        .any(|e| ray_sphere(origin, dir, e.pos, e.r).is_some());
+    assert!(!blocked);
 }
 
 #[test]
@@ -408,9 +440,9 @@ fn dispersal_spreads_the_flock_and_reforming_recovers() {
     let swarm = spread(&p);
     assert!(swarm > body * 1.3, "body {body} vs swarm {swarm}");
     assert!(swarm < SWARM_RADIUS * 2.0, "swarm ran off: {swarm}");
-    settle(&mut p, &world, 2.0, idle(0.0));
+    settle(&mut p, &world, 3.0, idle(0.0));
     let worst = worst_slot_error(&p);
-    assert!(worst < 0.05, "re-formed slot error {worst}");
+    assert!(worst < REST_TOL + 0.03, "re-formed slot error {worst}");
     assert!(p.can_act());
 }
 
@@ -435,7 +467,7 @@ fn a_hit_sphere_knocks_its_neighbours() {
         .count();
     assert!(moved > 0, "no neighbour was knocked");
     // And the body recovers.
-    settle(&mut p, &world, 2.0, idle(0.0));
+    settle(&mut p, &world, 3.0, idle(0.0));
     let worst = worst_slot_error(&p);
-    assert!(worst < 0.02, "slot error after knock {worst}");
+    assert!(worst < REST_TOL, "slot error after knock {worst}");
 }

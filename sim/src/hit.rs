@@ -1,27 +1,33 @@
 //! Server-side hitscan with penetration.
 
 use crate::math::{ray_sphere, Vec3};
-use crate::player::{Player, CORE_HIT_SCALE, CORE_ID};
+use crate::player::{Player, CORE_HIT_SCALE, CORE_ID, ELEM_HP};
 use crate::world::World;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Weapon {
-    /// Extra spheres the shot passes through after the first. Every sphere hit loses one hp.
+    /// Hp taken from every sphere the shot hits (`ELEM_HP` kills in one shot).
+    pub damage: u8,
+    /// Extra spheres the shot passes through after the first (`u8::MAX`: until a wall stops it).
     pub pierce: u8,
     pub range: f32,
 }
 
 impl Weapon {
     pub const RIFLE: Weapon = Weapon {
+        damage: 1,
         pierce: 0,
         range: 120.0,
     };
     pub const SHOTGUN_PELLET: Weapon = Weapon {
+        damage: 1,
         pierce: 0,
         range: 30.0,
     };
+    /// Kills every sphere it touches and goes clean through bodies.
     pub const RAILGUN: Weapon = Weapon {
-        pierce: 3,
+        damage: ELEM_HP,
+        pierce: u8::MAX,
         range: 300.0,
     };
 }
@@ -88,7 +94,7 @@ pub fn hitscan(
         } else {
             p.recoil(ei as usize, dir);
             let e = &mut p.elems[ei as usize];
-            e.hp = e.hp.saturating_sub(1);
+            e.hp = e.hp.saturating_sub(weapon.damage);
             e.hp == 0
         };
         events.push(HitEvent {

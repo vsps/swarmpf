@@ -46,13 +46,24 @@ pub const SWARM_RADIUS: f32 = 1.0;
 /// Coherent mode: each sphere is attracted to its slot by a soft, underdamped spring. Stiffness
 /// varies per sphere (heavier is softer, plus a random factor from the seed), so spheres trail
 /// by different amounts and the body wobbles and smears instead of moving as one rigid piece.
-const K_SLOT: f32 = 70.0;
-const K_JITTER: (f32, f32) = (0.6, 1.4);
+const K_SLOT: f32 = 40.0;
+const K_JITTER: (f32, f32) = (0.5, 1.5);
 /// Damping ratio of the slot spring: below 1, spheres overshoot and wobble when you stop.
-const SLOT_ZETA: f32 = 0.55;
+const SLOT_ZETA: f32 = 0.4;
 /// Fraction of the slot's velocity the damping matches. Below 1 the sphere lags its slot by
 /// about `2 * SLOT_ZETA * (1 - SLOT_FOLLOW) / sqrt(k)` seconds of motion.
-const SLOT_FOLLOW: f32 = 0.5;
+const SLOT_FOLLOW: f32 = 0.45;
+/// Coherent spheres drift around their slots on their own slow rhythms, so the body never
+/// looks welded to the skeleton: amplitude (m) standing still, and extra at full walking speed.
+pub const WANDER: f32 = 0.03;
+const WANDER_WALK: f32 = 0.04;
+/// Downward kick (m/s) every sphere gets at each footfall, scaled by walk amplitude and a
+/// per-sphere factor, so the body jiggles with every step.
+const STEP_KICK: f32 = 0.9;
+/// The pull grows with distance, `k * (1 + (d / REEL_DIST)^2)` capped at `REEL_MAX` times, so
+/// spheres stay loose near their slot but stragglers and re-forming swarms are reeled in fast.
+const REEL_DIST: f32 = 0.35;
+const REEL_MAX: f32 = 5.0;
 /// Speed caps: the coherent body needs headroom for swinging feet on top of walking speed.
 const MAX_SPEED_SWARM: f32 = 14.0;
 const MAX_SPEED_BODY: f32 = 28.0;
@@ -324,7 +335,15 @@ impl Player {
             0.0
         };
         self.walk_amp += (target_amp - self.walk_amp) * (dt * 10.0).min(1.0);
+        let old_phase = self.walk_phase;
         self.walk_phase = skeleton::advance_phase(self.walk_phase, ground_speed, dt);
+        // A foot lands every half cycle.
+        let half = std::f32::consts::PI;
+        if coherent && (old_phase / half).floor() != (self.walk_phase / half).floor() {
+            for (e, n) in self.elems.iter_mut().zip(&self.noise) {
+                e.vel.y -= STEP_KICK * self.walk_amp * (n[3] / 3.5);
+            }
+        }
 
         self.prev_targets.copy_from_slice(&self.targets);
         self.refresh_targets();
@@ -407,9 +426,17 @@ impl Player {
             if w_c > 0.0 {
                 // Attract to the slot, damped against part of the slot's own velocity.
                 let slack = self.stun[i] / STUN_TIME;
-                let k = self.stiff[i] * (1.0 - (1.0 - STUN_FLOOR) * slack);
+                let d = (self.targets[i] - p).len() / REEL_DIST;
+                let reel = (1.0 + d * d).min(REEL_MAX);
+                let k = self.stiff[i] * reel * (1.0 - (1.0 - STUN_FLOOR) * slack);
                 let c = 2.0 * SLOT_ZETA * k.sqrt();
-                let target = self.targets[i];
+                let n = &self.noise[i];
+                let wander = v3(
+                    (t * n[3] * 0.4 + n[1]).sin(),
+                    (t * n[4] * 0.4 + n[2]).sin(),
+                    (t * n[5] * 0.4 + n[0]).sin(),
+                ) * (WANDER + WANDER_WALK * self.walk_amp);
+                let target = self.targets[i] + wander;
                 let tv = self.target_vels[i] * SLOT_FOLLOW;
                 a += ((target - p) * k + (tv - v) * c) * w_c;
             }
