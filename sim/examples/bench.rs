@@ -43,6 +43,7 @@ fn main() {
                     forward: 1.0,
                     strafe: if i % 2 == 0 { 0.3 } else { -0.3 },
                     yaw: t * 0.4 + i as f32 + rep as f32,
+                    pitch: 0.0,
                     disperse: (5.0..10.0).contains(&t),
                 };
                 p.tick(&input, &world, DT);

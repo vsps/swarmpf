@@ -105,6 +105,7 @@ impl App {
             forward: axis(k.w, k.s),
             strafe: axis(k.d, k.a),
             yaw: self.game.yaw,
+            pitch: self.game.pitch,
             disperse: k.shift,
         }
     }

@@ -44,6 +44,10 @@ pub const BLEND_TIME: f32 = 0.4;
 /// Seconds to fully disperse: breaking apart is twice as quick as re-forming.
 pub const DISPERSE_TIME: f32 = 0.2;
 pub const SWARM_RADIUS: f32 = 1.0;
+/// Highest the dispersed core can fly: 25% above the body's height.
+pub const SWARM_MAX_Y: f32 = BODY_HEIGHT * 1.25;
+/// Near the ground the flock squashes vertically, by up to this factor with the core at the floor.
+const GROUND_SQUASH: f32 = 3.0;
 
 /// Coherent mode: each sphere is attracted to its slot by a soft, underdamped spring. Stiffness
 /// varies per sphere (heavier is softer, plus a random factor from the seed), so spheres trail
@@ -92,6 +96,8 @@ pub struct Input {
     pub strafe: f32,
     pub forward: f32,
     pub yaw: f32,
+    /// Look pitch (+ up). Steers the swarm up and down while dispersed; the body ignores it.
+    pub pitch: f32,
     /// Hold to be dispersed; release to re-form (if there is room).
     pub disperse: bool,
 }
@@ -215,6 +221,13 @@ impl Player {
         p
     }
 
+    /// Where the body's feet go when it re-forms around the core: under it, but never below the
+    /// floor (a body re-formed in mid-air falls).
+    fn feet_under_core(&self) -> Vec3 {
+        let c = self.core.pos;
+        v3(c.x, (c.y - CORE_HEIGHT).max(0.0), c.z)
+    }
+
     /// Body actions (fire, open doors) need a fully formed body.
     pub fn can_act(&self) -> bool {
         self.alive && self.blend <= 0.0 && !self.want_disperse
@@ -286,8 +299,7 @@ impl Player {
         self.time += dt;
         self.yaw = input.yaw;
         self.want_disperse = input.disperse
-            || (self.want_disperse
-                && !Self::body_fits(world, self.core.pos - v3(0.0, CORE_HEIGHT, 0.0)));
+            || (self.want_disperse && !Self::body_fits(world, self.feet_under_core()));
 
         let dir = v3(-input.strafe, 0.0, input.forward)
             .clamp_len(1.0)
@@ -314,12 +326,20 @@ impl Player {
             ground_speed = ((self.feet - old) * (1.0 / dt)).len().min(WALK_SPEED * 1.5);
             self.core_vel = Vec3::ZERO;
         } else {
-            // Swarm mode: the core is the leader and moves as a tiny sphere.
-            let want = dir * DISPERSED_SPEED;
+            // Swarm mode: the core is the leader and moves as a tiny sphere. Forward follows the
+            // look direction including pitch, so looking down flies it to the ground.
+            let (sp, cp) = input.pitch.sin_cos();
+            let look = v3(0.0, sp, cp).rot_y(self.yaw);
+            let side = v3(-1.0, 0.0, 0.0).rot_y(self.yaw);
+            let want =
+                (look * input.forward + side * input.strafe).clamp_len(1.0) * DISPERSED_SPEED;
             self.core_vel += (want - self.core_vel) * (dt * 8.0).min(1.0);
             let old = self.core.pos;
             self.core.pos += self.core_vel * dt;
-            self.core.pos.y = CORE_HEIGHT;
+            if self.core.pos.y > SWARM_MAX_Y {
+                self.core.pos.y = SWARM_MAX_Y;
+                self.core_vel.y = self.core_vel.y.min(0.0);
+            }
             let n = world.push_sphere(&mut self.core.pos, CORE_RADIUS);
             if n != Vec3::ZERO {
                 let n = n.normalized();
@@ -330,7 +350,7 @@ impl Player {
             }
             self.core.vel = (self.core.pos - old) * (1.0 / dt);
             // The (fading) body pose follows the core so re-forming starts in place.
-            self.feet = self.core.pos - v3(0.0, CORE_HEIGHT, 0.0);
+            self.feet = self.feet_under_core();
             self.body_vel = Vec3::ZERO;
             ground_speed = 0.0;
         }
@@ -414,6 +434,8 @@ impl Player {
         let core = self.core.pos;
         let core_vel = self.core.vel;
         let t = self.time;
+        let low = ((CORE_HEIGHT - core.y) / CORE_HEIGHT).clamp(0.0, 1.0);
+        let squash = 1.0 + (GROUND_SQUASH - 1.0) * low;
 
         // Neighbour accelerations read the frame-start positions.
         let mut snapshot = std::mem::take(&mut self.snapshot);
@@ -449,17 +471,21 @@ impl Player {
                 let inv_mass = R_MIN / r;
                 let mut f = Vec3::ZERO;
 
-                // Cohesion: soft shell around the leader.
-                let to_core = core - p;
+                // Cohesion: soft shell around the leader, squashed vertically as the core nears the
+                // ground (vertical offsets count `squash` times over), so a low swarm flattens.
+                let mut to_core = core - p;
+                to_core.y *= squash;
                 let dist = to_core.len();
                 let dir = to_core.normalized();
-                if dist > SWARM_RADIUS {
-                    f += dir * (28.0 * (dist - SWARM_RADIUS) + 6.0);
+                let mut fc = if dist > SWARM_RADIUS {
+                    dir * (28.0 * (dist - SWARM_RADIUS) + 6.0)
                 } else if dist < 0.25 {
-                    f -= dir * 20.0 * (0.25 - dist);
+                    -dir * 20.0 * (0.25 - dist)
                 } else {
-                    f += dir * 6.0 * (dist - 0.5 * SWARM_RADIUS);
-                }
+                    dir * 6.0 * (dist - 0.5 * SWARM_RADIUS)
+                };
+                fc.y *= squash;
+                f += fc;
                 // Follow the leader's velocity.
                 f += (core_vel - v) * 2.5;
                 // Separation.

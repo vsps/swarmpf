@@ -1,5 +1,5 @@
 //! Headless renderer: runs a scripted scenario and writes PNG screenshots.
-//! Usage: shot <out_prefix> [trace_scale]   writes walk, walk_raw, walk_raw8, walk_raw_temporal, settings, swarm, fire, aftermath, shotgun, gap, past_gap
+//! Usage: shot <out_prefix> [trace_scale]   writes walk, walk_raw, walk_raw8, walk_raw_temporal, settings, swarm, fire, aftermath, shotgun, gap, past_gap, dive
 //!        shot --bench        GPU ms per pass and mean image brightness, at trace scale 0.5 and 1.0
 
 use client::game::Game;
@@ -211,6 +211,32 @@ fn main() {
         "camera ticks inside a wall: {in_wall}; core z = {}",
         game.players[0].core.pos.z
     );
+
+    // 5. Look steeply down and fly the swarm to the floor; it flattens. Looking down lifts the
+    // third-person camera, which must stay under the ceiling (y = 4).
+    game.pitch = -1.2;
+    let mut cam_top = 0.0f32;
+    for _ in 0..(1.5 / sim::DT) as usize {
+        game.tick(Input {
+            forward: 1.0,
+            disperse: true,
+            ..Default::default()
+        });
+        cam_top = cam_top.max(game.camera(1.0).eye[1]);
+    }
+    run(
+        &mut game,
+        1.0,
+        Input {
+            disperse: true,
+            ..Default::default()
+        },
+    );
+    eprintln!(
+        "dive: core y = {:.2}, highest camera y = {cam_top:.2}",
+        game.players[0].core.pos.y
+    );
+    snap(&game, &mut renderer, "dive");
 }
 
 /// Time each pass on two scenes (coherent walk, dispersed swarm) at two trace scales, and print

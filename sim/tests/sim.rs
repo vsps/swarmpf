@@ -471,3 +471,92 @@ fn a_hit_sphere_knocks_its_neighbours() {
     let worst = worst_slot_error(&p);
     assert!(worst < REST_TOL, "slot error after knock {worst}");
 }
+
+#[test]
+fn swarm_dives_to_the_ground_flattens_and_reforms() {
+    let world = open_world();
+    let mut p = Player::spawn(6, Vec3::ZERO);
+    settle(&mut p, &world, 0.5, idle(0.0));
+    let spread = |p: &Player| {
+        let alive = p.elems.iter().filter(|e| e.alive());
+        let (mut ys, mut xz) = (0.0f32, 0.0f32);
+        let mut n = 0.0;
+        for e in alive {
+            let d = e.pos - p.core.pos;
+            ys += d.y.abs();
+            xz += (d.x * d.x + d.z * d.z).sqrt();
+            n += 1.0;
+        }
+        (ys / n, xz / n)
+    };
+    // Hover at chest height first, then fly forward looking steeply down.
+    settle(
+        &mut p,
+        &world,
+        1.5,
+        Input {
+            disperse: true,
+            ..idle(0.0)
+        },
+    );
+    let (y_mid, xz_mid) = spread(&p);
+    settle(
+        &mut p,
+        &world,
+        2.0,
+        Input {
+            forward: 1.0,
+            pitch: -1.2,
+            disperse: true,
+            ..idle(0.0)
+        },
+    );
+    assert!(p.core.pos.y < 0.15, "core at y = {}", p.core.pos.y);
+    settle(
+        &mut p,
+        &world,
+        1.5,
+        Input {
+            disperse: true,
+            ..idle(0.0)
+        },
+    );
+    let (y_low, xz_low) = spread(&p);
+    // Flatter: vertical spread shrinks relative to horizontal, well beyond what the floor alone
+    // does (about 0.54 of the hovering ratio without the ground squash, 0.22 with it).
+    assert!(
+        y_low / xz_low < 0.35 * (y_mid / xz_mid),
+        "low {y_low}/{xz_low} vs hovering {y_mid}/{xz_mid}"
+    );
+    // Release: the body re-forms standing on the floor.
+    settle(&mut p, &world, 2.0, idle(0.0));
+    assert!(p.can_act());
+    assert!(p.feet.y.abs() < 0.01, "feet at y = {}", p.feet.y);
+}
+
+#[test]
+fn swarm_cannot_fly_above_the_cap() {
+    let world = open_world();
+    let mut p = Player::spawn(7, Vec3::ZERO);
+    settle(
+        &mut p,
+        &world,
+        3.0,
+        Input {
+            forward: 1.0,
+            pitch: 1.4,
+            disperse: true,
+            ..idle(0.0)
+        },
+    );
+    assert!(
+        p.core.pos.y <= SWARM_MAX_Y + 1e-4,
+        "core at y = {}",
+        p.core.pos.y
+    );
+    assert!(p.core.pos.y > SWARM_MAX_Y - 0.05);
+    // Re-formed in mid-air, the body drops to the floor.
+    settle(&mut p, &world, 2.0, idle(0.0));
+    assert!(p.can_act());
+    assert!(p.feet.y.abs() < 0.01, "feet at y = {}", p.feet.y);
+}

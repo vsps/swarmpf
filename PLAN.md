@@ -13,6 +13,10 @@ Multiplayer FPS. Each player is a cloud of spheres around one small, lethal core
 - **Dispersed mode:** the spheres flock (boids) around the core, which is the flock leader. The player moves
   faster and fits through gaps the body cannot, but cannot act. Re-forming needs room for the body capsule.
   Dispersing takes `DISPERSE_TIME` (0.2 s), twice as quick as re-forming (`BLEND_TIME`, 0.4 s).
+  Dispersed, forward follows the look direction including pitch (`Input.pitch`), so the swarm can dive to the
+  floor or climb, up to `SWARM_MAX_Y` (25% above body height); with no input it hovers. Near the floor cohesion
+  squashes vertically (`GROUND_SQUASH`), flattening the swarm into a disc. The body re-forms with its feet under
+  the core but never below the floor; re-formed in mid-air it falls.
 - **Combat:** shots destroy spheres. Coherent players are easy to hit; dispersed players are hard to hit but can't
   shoot back.
 - **Look:** minimalist, no textures, no assets. Real-time ray tracing where every sphere is the only light source.
@@ -36,7 +40,7 @@ Multiplayer FPS. Each player is a cloud of spheres around one small, lethal core
 - **Procedural humanoid, no Mixamo.** 16-joint rig generated in code; every joint only swings about X. Pose is a
   pure function of (walk phase, amplitude) so server and clients agree. 64 slots on the bones (torso is two shells
   deep); slot layout mirrors legs.
-- **World is boxes only.** Level = floor + AABBs. Collision, hitscan and tracing all use simple primitives.
+- **World is boxes only.** Level = floor plane + AABBs (the ceiling is one, so the camera and shots stop at it). Collision, hitscan and tracing all use simple primitives.
 - **Shared sim crate.** `sim` has no dependencies and no I/O, so the future server and the client run identical code
   (prediction matches). Own `Vec3` and SplitMix64 `Rng`, no external crates.
 - **Ray tracer is software (compute), not hardware RT.** wgpu ray queries are experimental and native-only; the
@@ -115,7 +119,7 @@ Tuning knobs: `EMIT` / `CORE_EMIT` in `game.rs`, `exposure` in the scene, `EMITT
 
 ## Status
 
-Done and tested (16 sim tests): sphere swarm, hp model, core, hitscan with penetration and wall blocking, humanoid rig
+Done and tested (18 sim tests): sphere swarm, hp model, core, hitscan with penetration and wall blocking, humanoid rig
 and walk cycle, boid dispersal, gap filtering and no re-forming inside walls, debris.
 Done and checked only through headless screenshots: ray tracer, third-person camera, tracers, crosshair, hit flash.
 **Not yet run on real hardware**: the interactive window (mouse grab, vsync, resize, `[` / `]` scale keys), the mouse
@@ -158,7 +162,7 @@ yaw fix, and real GPU performance of the tracer.
 cargo test                                  # sim tests
 cargo clippy --all-targets
 cargo run --release --bin swarmpf           # play
-cargo run --release --bin shot -- out 0.5   # writes out_walk/walk_raw/walk_raw8/walk_raw_temporal/settings/swarm/fire/aftermath/shotgun/gap/past_gap.png
+cargo run --release --bin shot -- out 0.5   # writes out_walk/walk_raw/walk_raw8/walk_raw_temporal/settings/swarm/fire/aftermath/shotgun/gap/past_gap/dive.png
 cargo run --release --bin shot -- --bench   # GPU ms per pass, mean brightness (bias check), frame-to-frame noise
 cargo run --release --bin shot -- --bench quick  # only the raw walk scene at 1 and 8 samples per pixel
 cargo run --release -p sim --example bench  # physics us/tick and a position checksum (must not change on refactors)

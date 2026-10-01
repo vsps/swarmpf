@@ -135,6 +135,9 @@ pub struct Game {
     rng: Rng,
 }
 
+/// Index of the ceiling in `level()`'s boxes.
+const CEILING: usize = 11;
+
 fn level() -> World {
     let b = |x0, y0, z0, x1, y1, z1| Aabb::new(v3(x0, y0, z0), v3(x1, y1, z1));
     World {
@@ -153,12 +156,16 @@ fn level() -> World {
             b(4.0, 0.0, -8.0, 5.0, 3.0, -7.0),
             b(-3.0, 0.0, 10.0, -2.0, 3.0, 11.0),
             b(9.0, 0.0, 12.0, 11.0, 1.0, 13.0),
+            // Ceiling: collides with the camera and stops shots, as well as bouncing light.
+            b(-20.5, 4.0, -20.5, 20.5, 4.5, 20.5),
         ],
     }
 }
 
 fn box_color(i: usize) -> [f32; 4] {
-    if i < 4 {
+    if i == CEILING {
+        [0.5, 0.5, 0.52, 0.0]
+    } else if i < 4 {
         [0.62, 0.64, 0.70, 0.0]
     } else if i < 7 {
         [0.75, 0.68, 0.62, 0.0]
@@ -270,6 +277,7 @@ impl Game {
         let mut inputs: Vec<Input> = (0..self.players.len()).map(|i| self.bot_input(i)).collect();
         inputs[0] = Input {
             yaw: self.yaw,
+            pitch: self.pitch,
             ..local
         };
         for (i, inp) in inputs.iter().enumerate() {
@@ -563,16 +571,12 @@ impl Game {
                 albedo: box_color(i),
             })
             .collect();
-        // Floor and ceiling so light has something to bounce off.
+        // A floor slab so light has something to bounce off (the sim's floor is the plane y = 0;
+        // the ceiling is a level box).
         boxes.push(BoxInst {
             min: [-20.5, -0.5, -20.5, 0.0],
             max: [20.5, 0.0, 20.5, 0.0],
             albedo: [0.55, 0.55, 0.58, 0.0],
-        });
-        boxes.push(BoxInst {
-            min: [-20.5, 4.0, -20.5, 0.0],
-            max: [20.5, 4.5, 20.5, 0.0],
-            albedo: [0.5, 0.5, 0.52, 0.0],
         });
         let tracers = self
             .tracers
