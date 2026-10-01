@@ -1,5 +1,5 @@
 //! Headless renderer: runs a scripted scenario and writes PNG screenshots.
-//! Usage: shot <out_prefix> [trace_scale]   writes walk, walk_raw, swarm, fire, aftermath, shotgun, gap, past_gap
+//! Usage: shot <out_prefix> [trace_scale]   writes walk, walk_raw, walk_raw8, swarm, fire, aftermath, shotgun, gap, past_gap
 //!        shot --bench        GPU ms per pass and mean image brightness, at trace scale 0.5 and 1.0
 
 use client::game::Game;
@@ -31,7 +31,8 @@ fn main() {
     };
     let (device, queue) = pollster::block_on(adapter.request_device(&desc)).expect("device");
     if prefix == "--bench" {
-        bench(&device, &queue);
+        let quick = std::env::args().nth(2).as_deref() == Some("quick");
+        bench(&device, &queue, quick);
         return;
     }
     let mut renderer = Renderer::new(device.clone(), queue.clone(), FORMAT, W, H, scale);
@@ -88,6 +89,10 @@ fn main() {
     // Same frame as raw pixels: no interpolation, accumulation, blur or dither.
     renderer.set_raw(true);
     snap(&game, &mut renderer, "walk_raw");
+    // Raw with 8 lighting samples per pixel: less noise, still no interpolation.
+    renderer.set_spp(8);
+    snap(&game, &mut renderer, "walk_raw8");
+    renderer.set_spp(1);
     renderer.set_raw(false);
 
     // 2. Disperse.
@@ -191,7 +196,7 @@ fn main() {
 /// Time each pass on two scenes (coherent walk, dispersed swarm) at two trace scales, and print
 /// the mean brightness of the final image so a change to the light estimator can be checked
 /// for bias (noise averages out over the frame; the mean should not move).
-fn bench(device: &wgpu::Device, queue: &wgpu::Queue) {
+fn bench(device: &wgpu::Device, queue: &wgpu::Queue, quick: bool) {
     const FRAMES: usize = 200;
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("target"),
@@ -232,9 +237,22 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) {
     );
     let swarm = game.scene();
 
-    for scale in [0.5f32, 1.0] {
-        for (name, scene) in [("walk", &walk), ("swarm", &swarm)] {
+    // (label, scale, scene, raw, samples per pixel). `quick` only measures the walk scene in raw
+    // mode, which is what the samples-per-pixel setting is for.
+    let mut runs = vec![];
+    if !quick {
+        for scale in [0.5f32, 1.0] {
+            runs.push(("walk", scale, &walk, false, 1));
+            runs.push(("swarm", scale, &swarm, false, 1));
+        }
+    }
+    runs.push(("raw1", 0.5, &walk, true, 1));
+    runs.push(("raw8", 0.5, &walk, true, 8));
+    for (name, scale, scene, raw, spp) in runs {
+        {
             let mut r = Renderer::new(device.clone(), queue.clone(), FORMAT, W, H, scale);
+            r.set_raw(raw);
+            r.set_spp(spp);
             if !r.enable_timing() {
                 eprintln!("no timestamp queries on this adapter");
                 return;

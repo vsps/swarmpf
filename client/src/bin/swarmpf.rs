@@ -1,8 +1,9 @@
 //! Interactive client.
 //! WASD move, mouse look, Shift hold = disperse, LMB fire (rifle is automatic),
 //! 1/2/3 rifle / shotgun / railgun, V first/third person,
-//! [ and ] lower / raise the ray-trace resolution, I toggle raw pixels (no interpolation, AA or
-//! denoising), Esc release mouse. FPS and ray-traced resolution show top left.
+//! [ and ] lower / raise the ray-trace resolution, , and . fewer / more lighting samples per pixel
+//! (1, 2, 4, 8, 16), I toggle raw pixels (no interpolation, AA or denoising), Esc release mouse.
+//! FPS, ray-traced resolution and samples per pixel show top left.
 
 use client::game::Game;
 use client::renderer::Renderer;
@@ -176,6 +177,18 @@ impl ApplicationHandler for App {
                             if let Some(g) = &mut self.gfx {
                                 let s = g.renderer.scale() + 0.125;
                                 g.renderer.set_scale(s);
+                            }
+                        }
+                        KeyCode::Comma if down => {
+                            if let Some(g) = &mut self.gfx {
+                                let spp = (g.renderer.spp() / 2).max(1);
+                                g.renderer.set_spp(spp);
+                            }
+                        }
+                        KeyCode::Period if down => {
+                            if let Some(g) = &mut self.gfx {
+                                let spp = g.renderer.spp() * 2;
+                                g.renderer.set_spp(spp);
                             }
                         }
                         KeyCode::KeyI if down => {

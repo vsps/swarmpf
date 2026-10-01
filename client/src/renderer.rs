@@ -155,6 +155,8 @@ struct Timing {
     readback: wgpu::Buffer,
 }
 
+pub const MAX_SPP: u32 = 16;
+
 /// Names of the timed passes, in the order `Renderer::timings` reports them.
 pub const PASSES: [&str; 4] = ["trace", "temporal", "spatial", "present"];
 
@@ -162,6 +164,8 @@ pub struct Renderer {
     timing: Option<Timing>,
     /// Raw pixels: nearest-neighbour upscale, no temporal accumulation, spatial blur or dither.
     raw: bool,
+    /// Lighting samples per pixel (`MAX_SPP` at most).
+    spp: u32,
     /// Cached per frame parity; cleared when a buffer they point at is replaced.
     bind_groups: [Option<[wgpu::BindGroup; 4]>; 2],
     device: wgpu::Device,
@@ -417,6 +421,7 @@ impl Renderer {
             present: (ppipe, pbgl),
             timing: None,
             raw: false,
+            spp: 1,
             bind_groups: [None, None],
             device,
             queue,
@@ -512,6 +517,15 @@ impl Renderer {
 
     pub fn raw(&self) -> bool {
         self.raw
+    }
+
+    /// Lighting samples per pixel: noise falls as 1 / sqrt(spp), trace cost grows about linearly.
+    pub fn set_spp(&mut self, spp: u32) {
+        self.spp = spp.clamp(1, MAX_SPP);
+    }
+
+    pub fn spp(&self) -> u32 {
+        self.spp
     }
 
     fn rebuild_frame(&mut self) {
@@ -636,7 +650,7 @@ impl Renderer {
                 scene.hit_flash,
                 scene.fps,
             ],
-            flags: [self.srgb as u32, self.raw as u32, 0, 0],
+            flags: [self.srgb as u32, self.raw as u32, self.spp, 0],
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));

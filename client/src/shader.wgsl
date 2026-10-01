@@ -14,7 +14,8 @@ struct Globals {
     dims: vec4<u32>,    // trace w, trace h, output w, output h
     counts: vec4<u32>,  // spheres, groups, boxes, tracers
     params: vec4<f32>,  // frame, exposure, hit_flash, unused
-    flags: vec4<u32>,   // x: target is sRGB, y: raw (no upscale filtering, accumulation, blur, dither)
+    flags: vec4<u32>,   // x: target is sRGB, y: raw (no upscale filtering, accumulation, blur, dither),
+                        // z: lighting samples per pixel
 };
 
 struct Sphere {
@@ -416,7 +417,14 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         col = spheres[h.idx].emit.rgb * EMITTER_DISPLAY;
         id = f32(h.idx + 1u);
     } else {
-        col = shade_diffuse(p, h.n, boxes[h.idx].albedo.rgb);
+        // Average several independent lighting samples (light picks, shadow rays, bounce) for
+        // the same primary hit: noise falls as 1 / sqrt(samples). The primary ray stays at the
+        // pixel centre, so this adds no anti-aliasing.
+        let spp = max(g.flags.z, 1u);
+        for (var k = 0u; k < spp; k++) {
+            col += shade_diffuse(p, h.n, boxes[h.idx].albedo.rgb);
+        }
+        col /= f32(spp);
         id = -f32(h.idx + 1u);
     }
     // Clamp fireflies.
@@ -592,6 +600,7 @@ fn digit_at(v: u32, i: u32, width: u32, right: bool) -> u32 {
 // backdrop; `sc` scales with the output height.
 //   line 0: "123 FPS"
 //   line 1: "1280X720 100%"  ray-traced resolution and its share of the output width
+//   line 2: "4 SPP"          lighting samples per pixel
 fn draw_stats(p: vec2<f32>, sc: f32, col: vec3<f32>) -> vec3<f32> {
     // 0-9, F, P, X, %; S reuses 5.
     var font = array<u32, 14>(
@@ -600,14 +609,14 @@ fn draw_stats(p: vec2<f32>, sc: f32, col: vec3<f32>) -> vec3<f32> {
     );
     let px = 3.0 * sc;
     let cell = floor((p - vec2<f32>(10.0 * sc)) / px);
-    // Up to 13 characters of four columns (three lit plus a gap); two lines of five rows with a
-    // one-row gap; one cell of padding all round.
+    // Up to 13 characters of four columns (three lit plus a gap); three lines of five rows with
+    // one-row gaps; one cell of padding all round.
     let cols = 13.0 * 4.0 - 1.0;
-    if (cell.x < -1.0 || cell.y < -1.0 || cell.x > cols || cell.y > 11.0) {
+    if (cell.x < -1.0 || cell.y < -1.0 || cell.x > cols || cell.y > 17.0) {
         return col;
     }
     var out = col * 0.25;
-    if (cell.x < 0.0 || cell.y < 0.0 || cell.x >= cols || cell.y == 5.0 || cell.y > 10.0) {
+    if (cell.x < 0.0 || cell.y < 0.0 || cell.x >= cols || cell.y > 16.0 || u32(cell.y) % 6u == 5u) {
         return out;
     }
     let line = u32(cell.y) / 6u;
@@ -628,6 +637,14 @@ fn draw_stats(p: vec2<f32>, sc: f32, col: vec3<f32>) -> vec3<f32> {
             glyph = 11u;
         } else if (ch == 6u) {
             glyph = 5u;
+        }
+    } else if (line == 2u) {
+        if (ch < 2u) {
+            glyph = digit_at(min(max(g.flags.z, 1u), 99u), ch, 2u, true);
+        } else if (ch == 3u) {
+            glyph = 5u;
+        } else if (ch == 4u || ch == 5u) {
+            glyph = 11u;
         }
     } else {
         let pct = u32(round(100.0 * f32(g.dims.x) / f32(g.dims.z)));
