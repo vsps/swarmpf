@@ -1,11 +1,11 @@
 //! Headless renderer: runs a scripted scenario and writes PNG screenshots.
-//! Usage: shot <out_prefix> [trace_scale]   writes walk, walk_raw, walk_raw8, walk_raw_temporal, settings, swarm, fire, aftermath, shotgun, gap, past_gap, dive
+//! Usage: shot <out_prefix> [trace_scale]   writes walk, walk_raw, walk_raw8, walk_raw_temporal, settings, swarm, fire, death, death_late, aftermath, shotgun, reload, gap, past_gap, dive, columns, columns_through
 //!        shot --bench        GPU ms per pass and mean image brightness, at trace scale 0.5 and 1.0
 
 use client::game::Game;
 use client::renderer::{Renderer, PASSES};
 use client::ui::{self, Ui};
-use sim::player::Input;
+use sim::player::{Input, Player};
 
 const W: u32 = 1280;
 const H: u32 = 720;
@@ -155,16 +155,33 @@ fn main() {
     eprintln!("rifle hits: {hits}");
     run(&mut game, 0.03, Input::default());
     snap(&game, &mut renderer, "fire");
-    // Keep firing until the statue is dead, then show the aftermath.
+    // Keep firing until the statue is dead: its spheres burst, flash yellow, then fade to red and
+    // shrink away. Then show the aftermath once they are gone.
     game.weapon = 0;
+    let mut hit_count = 0;
     for _ in 0..400 {
-        game.fire();
+        // Track the core like a player would: the trailing camera keeps settling.
+        let cam = game.camera(70f32.to_radians());
+        let t = game.players[1].core.pos;
+        let (dx, dy, dz) = (t.x - cam.eye[0], t.y - cam.eye[1], t.z - cam.eye[2]);
+        game.yaw = dx.atan2(dz);
+        game.pitch = dy.atan2((dx * dx + dz * dz).sqrt());
+        hit_count += game.fire().len();
         run(&mut game, 0.05, Input::default());
         if !game.players[1].alive {
             break;
         }
     }
-    run(&mut game, 1.5, Input::default());
+    eprintln!(
+        "statue alive after firing: {} ({hit_count} hits, {} spheres left)",
+        game.players[1].alive,
+        game.players[1].alive_elements()
+    );
+    run(&mut game, 0.15, Input::default());
+    snap(&game, &mut renderer, "death");
+    run(&mut game, 0.6, Input::default());
+    snap(&game, &mut renderer, "death_late");
+    run(&mut game, 0.9, Input::default());
     snap(&game, &mut renderer, "aftermath");
     eprintln!("{}", game.status());
 
@@ -175,6 +192,9 @@ fn main() {
     eprintln!("shotgun hits: {}", hits.len());
     run(&mut game, 0.02, Input::default());
     snap(&game, &mut renderer, "shotgun");
+    // Mid-reload: the crosshair is a half-filled ring.
+    run(&mut game, 0.38, Input::default());
+    snap(&game, &mut renderer, "reload");
 
     // 4. Disperse and squeeze through the 0.5 m crack at x = 0, z = 6. The camera sphere has to
     // follow the swarm through the gap rather than cut through the wall.
@@ -237,6 +257,33 @@ fn main() {
         game.players[0].core.pos.y
     );
     snap(&game, &mut renderer, "dive");
+
+    // 6. The second room's 4x4 column grid: the body walks into the middle gap and is stopped;
+    // dispersed, the swarm flies through it.
+    game.players[0] = Player::spawn(5000, sim::math::v3(-2.5, 0.0, 7.0));
+    game.yaw = 0.0;
+    game.pitch = -0.1;
+    let walk = Input {
+        forward: 1.0,
+        ..Default::default()
+    };
+    run(&mut game, 2.0, walk);
+    let body_z = game.players[0].feet.z;
+    snap(&game, &mut renderer, "columns");
+    game.pitch = 0.0;
+    run(
+        &mut game,
+        1.6,
+        Input {
+            disperse: true,
+            ..walk
+        },
+    );
+    eprintln!(
+        "columns: body stopped at z = {body_z:.2} (grid starts at 9.15); swarm core reached z = {:.2} (grid ends at 11.85)",
+        game.players[0].core.pos.z
+    );
+    snap(&game, &mut renderer, "columns_through");
 }
 
 /// Time each pass on two scenes (coherent walk, dispersed swarm) at two trace scales, and print

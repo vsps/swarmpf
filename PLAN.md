@@ -41,6 +41,9 @@ Multiplayer FPS. Each player is a cloud of spheres around one small, lethal core
   pure function of (walk phase, amplitude) so server and clients agree. 64 slots on the bones (torso is two shells
   deep); slot layout mirrors legs.
 - **World is boxes only.** Level = floor plane + AABBs (the ceiling is one, so the camera and shots stop at it). Collision, hitscan and tracing all use simple primitives.
+  Test level (`game.rs::level`): spawn room and a second room past a dividing wall at z = 6 (a 0.5 m crack and a
+  1.4 m door). The second room has a 4x4 grid of thin floor-to-ceiling columns (`COLUMN_WIDTH` 0.3, `COLUMN_GAP`
+  0.5) around (-2.5, 10.5): the gaps are narrower than the body, so only a swarm passes.
 - **Shared sim crate.** `sim` has no dependencies and no I/O, so the future server and the client run identical code
   (prediction matches). Own `Vec3` and SplitMix64 `Rng`, no external crates.
 - **Ray tracer is software (compute), not hardware RT.** wgpu ray queries are experimental and native-only; the
@@ -74,8 +77,9 @@ client/   wgpu renderer + local game
 - Third-person camera is a sphere (`CAM_RADIUS`) that collides with the level and chases a goal behind the player
   (`CAM_LAG_*`, pulled back `CAM_BACK_SWARM` while dispersed). If a wall hides the goal it retraces the core's
   breadcrumb trail, so it follows the swarm through gaps. Dispersed, it turns to face the swarm's centroid.
-- Dead players: `kill()` marks them and gives spheres an outward impulse; `step_debris` makes them tumble.
-  The game respawns after 3 s.
+- Dead players: `kill()` marks them and gives spheres an outward burst; `step_debris` makes them tumble.
+  In the client the spheres flash bright yellow, then fade to red while shrinking to 5% over `DEATH_TIME`
+  (1.5 s) and vanish (`game.rs`, visual only). The game respawns after 3 s.
 
 ## Renderer
 
@@ -94,6 +98,8 @@ Passes (all in `shader.wgsl`):
    loads its 14x14 tile into workgroup memory once.
 4. **present** (fragment): bilinear upscale, ACES tone map, tracers (closest-approach glow, depth tested against the
    trace), crosshair, dither. Tracers and crosshair are drawn after tone mapping so they never enter history.
+   While the shotgun or railgun reloads (`Game::reload_progress`, `Scene.reload`), the crosshair becomes a ring
+   that fills clockwise from the top.
 5. **ui** (instanced quads, alpha blended, same render pass): HUD and settings panel from `ui.rs`, a 3x5 pixel
    font (A-Z, 0-9, symbols) laid out on the CPU in output pixels. HUD (top left): FPS, ray-traced resolution and
    its % of the output, samples per pixel, which smoothing is off. Esc releases the mouse and shows the settings
@@ -110,7 +116,9 @@ Display options (keys, or the settings panel):
 
 Performance (M2, 1280x720, `shot --bench`): trace is most of the frame. Shadow rays used to walk a body's ~65
 spheres and cost ~70% of trace; spheres no longer cast shadows, which removed that (and brightens the scene, as
-bodies no longer block their own light). Tried without gain before that: per-player sphere clusters (2-level
+bodies no longer block their own light). Box clusters (the column grid) are grouped on the CPU
+(`renderer.rs::box_chunks`) and skipped unless a ray reaches their bounds; loose boxes are tested in a flat loop.
+The grid costs ~7% of frame time this way, against ~23% testing all its boxes. Tried without gain before that: per-player sphere clusters (2-level
 BVH), loading only `pos_r`, largest-first sphere order, a single `direct_light` call site.
 On Apple GPUs the present pass's timestamps overlap the compute passes; trust the wall-clock ms/frame.
 
@@ -162,7 +170,7 @@ yaw fix, and real GPU performance of the tracer.
 cargo test                                  # sim tests
 cargo clippy --all-targets
 cargo run --release --bin swarmpf           # play
-cargo run --release --bin shot -- out 0.5   # writes out_walk/walk_raw/walk_raw8/walk_raw_temporal/settings/swarm/fire/aftermath/shotgun/gap/past_gap/dive.png
+cargo run --release --bin shot -- out 0.5   # writes out_walk/walk_raw/walk_raw8/walk_raw_temporal/settings/swarm/fire/death/death_late/aftermath/shotgun/reload/gap/past_gap/dive/columns/columns_through.png
 cargo run --release --bin shot -- --bench   # GPU ms per pass, mean brightness (bias check), frame-to-frame noise
 cargo run --release --bin shot -- --bench quick  # only the raw walk scene at 1 and 8 samples per pixel
 cargo run --release -p sim --example bench  # physics us/tick and a position checksum (must not change on refactors)

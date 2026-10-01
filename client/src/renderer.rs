@@ -70,6 +70,58 @@ fn bound_of(s: &[SphereInst]) -> [f32; 4] {
 /// Per-player bounding spheres (let rays skip whole swarms) and light power, and each group's
 /// light CDF (so the shader picks a sphere by power with a binary search instead of looping
 /// over every light).
+/// A run of boxes (`range`: first, count) and the box bounding them all.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BoxChunk {
+    bmin: [f32; 4],
+    bmax: [f32; 4],
+    range: [u32; 4],
+}
+
+/// Largest extent (m) and box count of a chunk.
+const CHUNK_EXTENT: f32 = 4.0;
+const CHUNK_MAX: usize = 32;
+
+/// Group consecutive boxes into chunks whose bounds stay within `CHUNK_EXTENT`, so a ray tests
+/// a cluster's bounds once instead of each of its boxes (the column grid is one chunk). Returns
+/// the boxes reordered with the loose ones (chunks of one: walls, floor, ceiling) first, how many
+/// are loose, and the multi-box chunks. The shader tests loose boxes in a flat loop.
+fn box_chunks(boxes: &[BoxInst]) -> (Vec<BoxInst>, u32, Vec<BoxChunk>) {
+    let mut runs: Vec<(usize, usize, [f32; 3], [f32; 3])> = Vec::new();
+    for (i, b) in boxes.iter().enumerate() {
+        let (bmin, bmax) = (
+            [b.min[0], b.min[1], b.min[2]],
+            [b.max[0], b.max[1], b.max[2]],
+        );
+        if let Some(r) = runs.last_mut() {
+            let lo: [f32; 3] = std::array::from_fn(|k| r.2[k].min(bmin[k]));
+            let hi: [f32; 3] = std::array::from_fn(|k| r.3[k].max(bmax[k]));
+            if (0..3).all(|k| hi[k] - lo[k] <= CHUNK_EXTENT) && r.1 < CHUNK_MAX {
+                *r = (r.0, r.1 + 1, lo, hi);
+                continue;
+            }
+        }
+        runs.push((i, 1, bmin, bmax));
+    }
+    let mut out: Vec<BoxInst> = runs
+        .iter()
+        .filter(|r| r.1 == 1)
+        .map(|r| boxes[r.0])
+        .collect();
+    let loose = out.len() as u32;
+    let mut chunks = Vec::new();
+    for &(first, n, lo, hi) in runs.iter().filter(|r| r.1 > 1) {
+        chunks.push(BoxChunk {
+            bmin: [lo[0], lo[1], lo[2], 0.0],
+            bmax: [hi[0], hi[1], hi[2], 0.0],
+            range: [out.len() as u32, n as u32, 0, 0],
+        });
+        out.extend_from_slice(&boxes[first..first + n]);
+    }
+    (out, loose, chunks)
+}
+
 fn build_accel(scene: &Scene) -> (Vec<GroupGpu>, Vec<f32>) {
     let luminance = |e: &[f32; 4]| 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2];
     let mut groups = Vec::new();
@@ -112,6 +164,8 @@ struct Globals {
     counts: [u32; 4],
     params: [f32; 4],
     flags: [u32; 4],
+    /// x: box chunk count.
+    counts2: [u32; 4],
 }
 
 pub struct Scene {
@@ -122,6 +176,9 @@ pub struct Scene {
     pub boxes: Vec<BoxInst>,
     pub tracers: Vec<TracerInst>,
     pub hit_flash: f32,
+    /// Weapon reload progress in [0, 1] (the crosshair becomes a filling ring), or negative when
+    /// there is nothing to show.
+    pub reload: f32,
     pub exposure: f32,
     /// HUD and menu quads, drawn over the image.
     pub ui: Vec<UiInst>,
@@ -184,6 +241,8 @@ pub struct Renderer {
     groups: Growable,
     /// Per sphere: the running fraction of its group's light power (a CDF for picking lights).
     cdf: Growable,
+    /// Runs of nearby boxes with a bounding box, so rays skip whole clusters (see `box_chunks`).
+    chunks: Growable,
     tracers: Growable,
     fbuf: Frame,
     trace: (wgpu::ComputePipeline, wgpu::BindGroupLayout),
@@ -344,6 +403,7 @@ impl Renderer {
                 (5, Rw),
                 (6, Rw),
                 (18, Ro),
+                (21, Ro),
             ],
         );
         let temporal = compute(
@@ -456,6 +516,7 @@ impl Renderer {
             boxes: storage(&device, "boxes", 1 << 12),
             groups: storage(&device, "groups", 1 << 10),
             cdf: storage(&device, "cdf", 1 << 12),
+            chunks: storage(&device, "chunks", 1 << 12),
             tracers: storage(&device, "tracers", 1 << 10),
             fbuf: make_frame(&device, tw, th),
             trace,
@@ -638,6 +699,7 @@ impl Renderer {
                     (5, &f.gpos[cur]),
                     (6, &f.gnrm[cur]),
                     (18, &self.cdf.buf),
+                    (21, &self.chunks.buf),
                 ],
             ),
             bind(
@@ -693,6 +755,7 @@ impl Renderer {
         let (prev_vp, prev_eye) = self.prev.unwrap_or((view_proj, c.eye));
 
         let (groups, cdf) = build_accel(scene);
+        let (boxes, loose, chunks) = box_chunks(&scene.boxes);
 
         let f = &self.fbuf;
         let globals = Globals {
@@ -711,24 +774,31 @@ impl Renderer {
             counts: [
                 scene.spheres.len() as u32,
                 groups.len() as u32,
-                scene.boxes.len() as u32,
+                loose,
                 scene.tracers.len() as u32,
             ],
-            params: [self.frame_no as f32, scene.exposure, scene.hit_flash, 0.0],
+            params: [
+                self.frame_no as f32,
+                scene.exposure,
+                scene.hit_flash,
+                scene.reload,
+            ],
             flags: [
                 self.srgb as u32,
                 self.raw as u32,
                 self.spp,
                 self.accumulate as u32,
             ],
+            counts2: [chunks.len() as u32, 0, 0, 0],
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
         let (d, q) = (&self.device, &self.queue);
         let grown = Self::upload(d, q, &mut self.spheres, &scene.spheres)
-            | Self::upload(d, q, &mut self.boxes, &scene.boxes)
+            | Self::upload(d, q, &mut self.boxes, &boxes)
             | Self::upload(d, q, &mut self.groups, &groups)
             | Self::upload(d, q, &mut self.cdf, &cdf)
+            | Self::upload(d, q, &mut self.chunks, &chunks)
             | Self::upload(d, q, &mut self.tracers, &scene.tracers)
             | Self::upload(d, q, &mut self.ui, &scene.ui);
         if grown {

@@ -609,7 +609,7 @@ impl Player {
         let core = self.core.pos;
         for e in self.elems.iter_mut().filter(|e| e.alive()) {
             let out = (e.pos - core).normalized();
-            e.vel = out * rng.range(1.0, 4.0) + v3(0.0, rng.range(1.0, 4.0), 0.0);
+            e.vel = out * rng.range(2.5, 6.0) + v3(0.0, rng.range(1.0, 4.0), 0.0);
         }
     }
 

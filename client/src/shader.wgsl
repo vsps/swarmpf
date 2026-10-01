@@ -12,10 +12,11 @@ struct Globals {
     fwd: vec4<f32>,
     prev_eye: vec4<f32>,
     dims: vec4<u32>,    // trace w, trace h, output w, output h
-    counts: vec4<u32>,  // spheres, groups, boxes, tracers
-    params: vec4<f32>,  // frame, exposure, hit_flash, unused
+    counts: vec4<u32>,  // spheres, groups, loose boxes (tested one by one), tracers
+    params: vec4<f32>,  // frame, exposure, hit_flash, reload progress (< 0: none)
     flags: vec4<u32>,   // x: target is sRGB, y: raw (nearest upscale, no blur, no dither),
                         // z: lighting samples per pixel, w: temporal accumulation on
+    counts2: vec4<u32>, // x: box chunks
 };
 
 struct Sphere {
@@ -58,6 +59,13 @@ struct Tracer {
 @group(0) @binding(17) var<storage, read> tracers: array<Tracer>;
 // Per sphere: running fraction of its group's light power (see renderer.rs).
 @group(0) @binding(18) var<storage, read> cdf: array<f32>;
+// Runs of nearby boxes with their bounds (see renderer.rs `box_chunks`).
+struct BoxChunk {
+    bmin: vec4<f32>,
+    bmax: vec4<f32>,
+    range: vec4<u32>,   // first box, count
+};
+@group(0) @binding(21) var<storage, read> chunks: array<BoxChunk>;
 
 const PI: f32 = 3.14159265;
 const NO_SPHERE: u32 = 0xffffffffu;
@@ -90,6 +98,15 @@ fn luminance(c: vec3<f32>) -> f32 {
 // Computed once per ray and shared by every box test.
 fn inv_dir(d: vec3<f32>) -> vec3<f32> {
     return 1.0 / select(d, vec3<f32>(1.0e-8), abs(d) < vec3<f32>(1.0e-8));
+}
+
+// Does the ray overlap the box anywhere in [0, tmax] (also true starting inside it)?
+fn ray_overlaps(o: vec3<f32>, inv: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>, tmax: f32) -> bool {
+    let t0 = (bmin - o) * inv;
+    let t1 = (bmax - o) * inv;
+    let te = max(max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z)), 0.0);
+    let tx = min(min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z)), tmax);
+    return te <= tx;
 }
 
 fn ray_box(o: vec3<f32>, inv: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec4<f32> {
@@ -162,6 +179,22 @@ fn trace(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Hit {
             h.n = r.yzw;
         }
     }
+    // Clusters of boxes (the column grid): skip the lot unless the ray reaches their bounds.
+    for (var ci = 0u; ci < g.counts2.x; ci++) {
+        let ch = chunks[ci];
+        if (!ray_overlaps(o, inv, ch.bmin.xyz, ch.bmax.xyz, h.t)) {
+            continue;
+        }
+        for (var i = ch.range.x; i < ch.range.x + ch.range.y; i++) {
+            let r = ray_box(o, inv, boxes[i].bmin.xyz, boxes[i].bmax.xyz);
+            if (r.x > 1.0e-4 && r.x < h.t) {
+                h.t = r.x;
+                h.kind = 1u;
+                h.idx = i;
+                h.n = r.yzw;
+            }
+        }
+    }
     for (var gi = 0u; gi < g.counts.y; gi++) {
         let gr = groups[gi];
         if (!hits_bound(o, d, gr.bound, h.t)) {
@@ -191,6 +224,18 @@ fn occluded(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> bool {
         let r = ray_box(o, inv, boxes[i].bmin.xyz, boxes[i].bmax.xyz);
         if (r.x > 1.0e-4 && r.x < tmax) {
             return true;
+        }
+    }
+    for (var ci = 0u; ci < g.counts2.x; ci++) {
+        let ch = chunks[ci];
+        if (!ray_overlaps(o, inv, ch.bmin.xyz, ch.bmax.xyz, tmax)) {
+            continue;
+        }
+        for (var i = ch.range.x; i < ch.range.x + ch.range.y; i++) {
+            let r = ray_box(o, inv, boxes[i].bmin.xyz, boxes[i].bmax.xyz);
+            if (r.x > 1.0e-4 && r.x < tmax) {
+                return true;
+            }
         }
     }
     return false;
@@ -620,16 +665,37 @@ fn fs_present(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     col = min(col, vec3<f32>(1.0));
 
     // Crosshair (scales with output height; outline for contrast; red briefly after a hit).
+    // While a slow weapon reloads it becomes a ring that fills clockwise from the top.
     let sc = out_size.y / 720.0;
-    let c = abs(fc.xy - out_size * 0.5) / sc;
-    let gap = 5.0;
-    let len = 12.0;
-    let arm = (c.x >= gap && c.x <= len && c.y <= 1.0) || (c.y >= gap && c.y <= len && c.x <= 1.0);
-    let arm_o = (c.x >= gap - 1.0 && c.x <= len + 1.0 && c.y <= 2.0) || (c.y >= gap - 1.0 && c.y <= len + 1.0 && c.x <= 2.0);
-    if (arm) {
-        col = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(1.0, 0.15, 0.1), clamp(g.params.z * 6.0, 0.0, 1.0));
-    } else if (arm_o) {
-        col = vec3<f32>(0.0);
+    let tint = mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(1.0, 0.15, 0.1), clamp(g.params.z * 6.0, 0.0, 1.0));
+    let reload = g.params.w;
+    if (reload >= 0.0) {
+        let v = (fc.xy - out_size * 0.5) / sc;
+        let dist = abs(length(v) - 10.0);
+        if (dist <= 1.5) {
+            var ang = atan2(v.x, -v.y);
+            if (ang < 0.0) {
+                ang += 6.2831853;
+            }
+            if (ang / 6.2831853 <= reload) {
+                col = tint;
+            } else {
+                col = col * 0.35 + vec3<f32>(0.08);
+            }
+        } else if (dist <= 2.5) {
+            col = vec3<f32>(0.0);
+        }
+    } else {
+        let c = abs(fc.xy - out_size * 0.5) / sc;
+        let gap = 5.0;
+        let len = 12.0;
+        let arm = (c.x >= gap && c.x <= len && c.y <= 1.0) || (c.y >= gap && c.y <= len && c.x <= 1.0);
+        let arm_o = (c.x >= gap - 1.0 && c.x <= len + 1.0 && c.y <= 2.0) || (c.y >= gap - 1.0 && c.y <= len + 1.0 && c.x <= 2.0);
+        if (arm) {
+            col = tint;
+        } else if (arm_o) {
+            col = vec3<f32>(0.0);
+        }
     }
 
     // Tiny dither hides banding in the dark gradients (off in raw mode).

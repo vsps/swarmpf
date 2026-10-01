@@ -78,6 +78,12 @@ const EMIT: f32 = 7.0;
 const CORE_EMIT: f32 = 60.0;
 /// Colour of a sphere that has been hit, until it regrows.
 const HIT_COLOR: [f32; 3] = [1.0, 0.08, 0.05];
+/// A dead player's spheres flash bright yellow, then fade to red while shrinking to
+/// `DEATH_SHRINK` of their size over `DEATH_TIME` seconds, then vanish.
+const DEATH_TIME: f32 = 1.5;
+const DEATH_SHRINK: f32 = 0.05;
+const DEATH_FLASH: [f32; 3] = [1.0, 0.85, 0.25];
+const DEATH_END: [f32; 3] = [1.0, 0.08, 0.03];
 
 struct Tracer {
     a: Vec3,
@@ -111,6 +117,7 @@ enum Bot {
 
 pub struct Game {
     pub world: World,
+    box_colors: Vec<[f32; 4]>,
     pub players: Vec<Player>,
     pub yaw: f32,
     pub pitch: f32,
@@ -135,44 +142,49 @@ pub struct Game {
     rng: Rng,
 }
 
-/// Index of the ceiling in `level()`'s boxes.
-const CEILING: usize = 11;
-
-fn level() -> World {
+/// The test level: its boxes and each box's colour.
+fn level() -> (World, Vec<[f32; 4]>) {
     let b = |x0, y0, z0, x1, y1, z1| Aabb::new(v3(x0, y0, z0), v3(x1, y1, z1));
-    World {
-        boxes: vec![
-            // Outer walls.
-            b(-20.5, 0.0, -20.5, 20.5, 4.0, -20.0),
-            b(-20.5, 0.0, 20.0, 20.5, 4.0, 20.5),
-            b(-20.5, 0.0, -20.0, -20.0, 4.0, 20.0),
-            b(20.0, 0.0, -20.0, 20.5, 4.0, 20.0),
-            // Dividing wall at z = 6: a 0.5 m crack at x = 0 (swarm only) and a 1.4 m door at x = 8.
-            b(-20.0, 0.0, 5.75, -0.25, 4.0, 6.25),
-            b(0.25, 0.0, 5.75, 7.3, 4.0, 6.25),
-            b(8.7, 0.0, 5.75, 20.0, 4.0, 6.25),
-            // Cover and pillars.
-            b(-8.0, 0.0, -4.0, -6.0, 1.2, -3.0),
-            b(4.0, 0.0, -8.0, 5.0, 3.0, -7.0),
-            b(-3.0, 0.0, 10.0, -2.0, 3.0, 11.0),
-            b(9.0, 0.0, 12.0, 11.0, 1.0, 13.0),
-            // Ceiling: collides with the camera and stops shots, as well as bouncing light.
-            b(-20.5, 4.0, -20.5, 20.5, 4.5, 20.5),
-        ],
+    let wall = [0.62, 0.64, 0.70, 0.0];
+    let divider = [0.75, 0.68, 0.62, 0.0];
+    let cover = [0.55, 0.62, 0.75, 0.0];
+    let ceiling = [0.5, 0.5, 0.52, 0.0];
+    let mut boxes = vec![
+        // Outer walls.
+        (b(-20.5, 0.0, -20.5, 20.5, 4.0, -20.0), wall),
+        (b(-20.5, 0.0, 20.0, 20.5, 4.0, 20.5), wall),
+        (b(-20.5, 0.0, -20.0, -20.0, 4.0, 20.0), wall),
+        (b(20.0, 0.0, -20.0, 20.5, 4.0, 20.0), wall),
+        // Dividing wall at z = 6: a 0.5 m crack at x = 0 (swarm only) and a 1.4 m door at x = 8.
+        (b(-20.0, 0.0, 5.75, -0.25, 4.0, 6.25), divider),
+        (b(0.25, 0.0, 5.75, 7.3, 4.0, 6.25), divider),
+        (b(8.7, 0.0, 5.75, 20.0, 4.0, 6.25), divider),
+        // Cover and pillars.
+        (b(-8.0, 0.0, -4.0, -6.0, 1.2, -3.0), cover),
+        (b(4.0, 0.0, -8.0, 5.0, 3.0, -7.0), cover),
+        (b(9.0, 0.0, 12.0, 11.0, 1.0, 13.0), cover),
+        // Ceiling: collides with the camera and stops shots, as well as bouncing light.
+        (b(-20.5, 4.0, -20.5, 20.5, 4.5, 20.5), ceiling),
+    ];
+    // Second room: a 4x4 grid of thin floor-to-ceiling columns around (-2.5, 10.5). The 0.5 m
+    // gaps (like the crack) are narrower than the body capsule, so only a swarm gets through.
+    let (w, gap) = (COLUMN_WIDTH, COLUMN_GAP);
+    let span = 4.0 * w + 3.0 * gap;
+    let (x0, z0) = (-2.5 - span * 0.5, 10.5 - span * 0.5);
+    for i in 0..4 {
+        for k in 0..4 {
+            let x = x0 + i as f32 * (w + gap);
+            let z = z0 + k as f32 * (w + gap);
+            boxes.push((b(x, 0.0, z, x + w, 4.0, z + w), cover));
+        }
     }
+    let (boxes, colors) = boxes.into_iter().unzip();
+    (World { boxes }, colors)
 }
 
-fn box_color(i: usize) -> [f32; 4] {
-    if i == CEILING {
-        [0.5, 0.5, 0.52, 0.0]
-    } else if i < 4 {
-        [0.62, 0.64, 0.70, 0.0]
-    } else if i < 7 {
-        [0.75, 0.68, 0.62, 0.0]
-    } else {
-        [0.55, 0.62, 0.75, 0.0]
-    }
-}
+/// Columns of the second room's grid, and the gaps between them.
+const COLUMN_WIDTH: f32 = 0.3;
+const COLUMN_GAP: f32 = 0.5;
 
 impl Game {
     pub fn new() -> Game {
@@ -197,8 +209,10 @@ impl Game {
             .map(|(i, &p)| Player::spawn(100 + i as u32, p))
             .collect();
         let n = players.len();
+        let (world, box_colors) = level();
         Game {
-            world: level(),
+            world,
+            box_colors,
             players,
             yaw: 0.0,
             pitch: 0.0,
@@ -469,6 +483,14 @@ impl Game {
         me.feet + v3(0.0, 1.4, 0.0) + v3(-1.0, 0.0, 0.0).rot_y(self.yaw) * 0.2
     }
 
+    /// How far the current weapon has reloaded, in [0, 1], while a slow (non-automatic) weapon
+    /// is reloading; None when ready or for the automatic rifle.
+    pub fn reload_progress(&self) -> Option<f32> {
+        let gun = &WEAPONS[self.weapon];
+        (!gun.auto && self.cooldown > 0.0)
+            .then(|| (1.0 - self.cooldown / gun.cooldown).clamp(0.0, 1.0))
+    }
+
     pub fn cycle_weapon(&mut self, i: usize) {
         self.weapon = i % WEAPONS.len();
     }
@@ -537,18 +559,31 @@ impl Game {
             }
             let start = spheres.len() as u32;
             let base = PALETTE[pi % PALETTE.len()];
+            // Death: 0 at the moment of death, 1 when the debris has burnt out.
+            let death = (!p.alive).then(|| (self.dead_for[pi] / DEATH_TIME).min(1.0));
+            if death == Some(1.0) {
+                groups.push((start, 0));
+                continue;
+            }
             for e in p.elems.iter().filter(|e| e.alive()) {
-                // Every sphere is a light. A hit turns it red until it regrows; a dead player's
-                // debris goes dark.
-                let (emit, albedo) = if p.alive {
-                    let c = if e.hp < e.max_hp { HIT_COLOR } else { base };
-                    ([c[0] * EMIT, c[1] * EMIT, c[2] * EMIT], 0.35)
-                } else {
-                    ([0.02; 3], 0.4)
+                // Every sphere is a light. A hit turns it red until it regrows. A dead player's
+                // spheres burn out: bright yellow fading to red, shrinking away.
+                let (emit, r) = match death {
+                    None => {
+                        let c = if e.hp < e.max_hp { HIT_COLOR } else { base };
+                        ([c[0] * EMIT, c[1] * EMIT, c[2] * EMIT], e.r)
+                    }
+                    Some(t) => {
+                        let k = EMIT * (1.0 + 3.0 * (1.0 - t) * (1.0 - t));
+                        let c: [f32; 3] = std::array::from_fn(|i| {
+                            (DEATH_FLASH[i] + (DEATH_END[i] - DEATH_FLASH[i]) * t) * k
+                        });
+                        (c, e.r * (1.0 + (DEATH_SHRINK - 1.0) * t))
+                    }
                 };
                 spheres.push(SphereInst {
-                    pos_r: [e.pos.x, e.pos.y, e.pos.z, e.r],
-                    emit: [emit[0], emit[1], emit[2], albedo],
+                    pos_r: [e.pos.x, e.pos.y, e.pos.z, r],
+                    emit: [emit[0], emit[1], emit[2], 0.35],
                 });
             }
             if p.alive {
@@ -568,7 +603,7 @@ impl Game {
             .map(|(i, b)| BoxInst {
                 min: [b.min.x, b.min.y, b.min.z, 0.0],
                 max: [b.max.x, b.max.y, b.max.z, 0.0],
-                albedo: box_color(i),
+                albedo: self.box_colors[i],
             })
             .collect();
         // A floor slab so light has something to bounce off (the sim's floor is the plane y = 0;
@@ -601,6 +636,7 @@ impl Game {
             boxes,
             tracers,
             hit_flash: self.hit_flash,
+            reload: self.reload_progress().unwrap_or(-1.0),
             exposure: 1.0,
             ui: Vec::new(),
         }
