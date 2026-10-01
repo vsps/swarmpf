@@ -39,8 +39,10 @@ pub const CORE_ID: u8 = u8::MAX;
 pub const BODY_RADIUS: f32 = 0.3;
 pub const BODY_HEIGHT: f32 = 1.8;
 pub const DISPERSED_SPEED: f32 = 6.5;
-/// Seconds to fully disperse or re-form.
+/// Seconds to fully re-form the body.
 pub const BLEND_TIME: f32 = 0.4;
+/// Seconds to fully disperse: breaking apart is twice as quick as re-forming.
+pub const DISPERSE_TIME: f32 = 0.2;
 pub const SWARM_RADIUS: f32 = 1.0;
 
 /// Coherent mode: each sphere is attracted to its slot by a soft, underdamped spring. Stiffness
@@ -291,12 +293,11 @@ impl Player {
             .clamp_len(1.0)
             .rot_y(self.yaw);
 
-        let rate = dt / BLEND_TIME;
         let target = if self.want_disperse { 1.0 } else { 0.0 };
         self.blend = if self.blend < target {
-            (self.blend + rate).min(target)
+            (self.blend + dt / DISPERSE_TIME).min(target)
         } else {
-            (self.blend - rate).max(target)
+            (self.blend - dt / BLEND_TIME).max(target)
         };
 
         let coherent = self.blend <= 0.0 && !self.want_disperse;

@@ -40,7 +40,7 @@ pub const WEAPONS: [Gun; 3] = [
         cooldown: 0.8,
         auto: false,
         pellets: 15,
-        spread_deg: 3.0,
+        spread_deg: 6.0,
         color: [1.0, 0.5, 0.2],
     },
     Gun {

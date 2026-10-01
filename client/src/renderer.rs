@@ -160,6 +160,8 @@ pub const PASSES: [&str; 4] = ["trace", "temporal", "spatial", "present"];
 
 pub struct Renderer {
     timing: Option<Timing>,
+    /// Raw pixels: nearest-neighbour upscale, no temporal accumulation, spatial blur or dither.
+    raw: bool,
     /// Cached per frame parity; cleared when a buffer they point at is replaced.
     bind_groups: [Option<[wgpu::BindGroup; 4]>; 2],
     device: wgpu::Device,
@@ -414,6 +416,7 @@ impl Renderer {
             spatial,
             present: (ppipe, pbgl),
             timing: None,
+            raw: false,
             bind_groups: [None, None],
             device,
             queue,
@@ -498,6 +501,17 @@ impl Renderer {
 
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// Turn every smoothing step off (or back on): nearest-neighbour upscale, no temporal
+    /// accumulation, no spatial blur, no dither. The image shows the raw ray-traced pixels.
+    pub fn set_raw(&mut self, raw: bool) {
+        self.raw = raw;
+        self.prev = None; // history from the other mode does not apply
+    }
+
+    pub fn raw(&self) -> bool {
+        self.raw
     }
 
     fn rebuild_frame(&mut self) {
@@ -622,7 +636,7 @@ impl Renderer {
                 scene.hit_flash,
                 scene.fps,
             ],
-            flags: [self.srgb as u32, 0, 0, 0],
+            flags: [self.srgb as u32, self.raw as u32, 0, 0],
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));

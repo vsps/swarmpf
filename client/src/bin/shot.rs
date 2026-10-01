@@ -1,5 +1,5 @@
 //! Headless renderer: runs a scripted scenario and writes PNG screenshots.
-//! Usage: shot <out_prefix> [trace_scale]
+//! Usage: shot <out_prefix> [trace_scale]   writes walk, walk_raw, swarm, fire, aftermath, shotgun, gap, past_gap
 //!        shot --bench        GPU ms per pass and mean image brightness, at trace scale 0.5 and 1.0
 
 use client::game::Game;
@@ -85,6 +85,10 @@ fn main() {
         },
     );
     snap(&game, &mut renderer, "walk");
+    // Same frame as raw pixels: no interpolation, accumulation, blur or dither.
+    renderer.set_raw(true);
+    snap(&game, &mut renderer, "walk_raw");
+    renderer.set_raw(false);
 
     // 2. Disperse.
     run(

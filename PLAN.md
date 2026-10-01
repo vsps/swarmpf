@@ -12,6 +12,7 @@ Multiplayer FPS. Each player is a cloud of spheres around one small, lethal core
   and can fire weapons and use things (doors are not implemented yet).
 - **Dispersed mode:** the spheres flock (boids) around the core, which is the flock leader. The player moves
   faster and fits through gaps the body cannot, but cannot act. Re-forming needs room for the body capsule.
+  Dispersing takes `DISPERSE_TIME` (0.2 s), twice as quick as re-forming (`BLEND_TIME`, 0.4 s).
 - **Combat:** shots destroy spheres. Coherent players are easy to hit; dispersed players are hard to hit but can't
   shoot back.
 - **Look:** minimalist, no textures, no assets. Real-time ray tracing where every sphere is the only light source.
@@ -30,7 +31,7 @@ Multiplayer FPS. Each player is a cloud of spheres around one small, lethal core
   intact body shields the core and damage opens lines to it.
 - **Penetration.** `Weapon.pierce` extra spheres per shot, `Weapon.damage` hp each. Rifle and pellet: 1 damage,
   no pierce. Railgun: 2 damage (one-shots spheres) and unlimited pierce, stopped only by walls.
-- **Guns** (`WEAPONS` in `game.rs`): rifle automatic; shotgun fires 15 pellets uniformly in a 3 degree cone; railgun
+- **Guns** (`WEAPONS` in `game.rs`): rifle automatic; shotgun fires 15 pellets uniformly in a 6 degree cone; railgun
   semi-automatic. Damaged spheres show `HIT_COLOR` (red) until they regrow.
 - **Procedural humanoid, no Mixamo.** 16-joint rig generated in code; every joint only swings about X. Pose is a
   pure function of (walk phase, amplitude) so server and clients agree. 64 slots on the bones (torso is two shells
@@ -87,7 +88,9 @@ Passes (all in `shader.wgsl`):
 3. **spatial** (compute): 7x7 bilateral on normals and plane distance, static surfaces only; each 8x8 workgroup
    loads its 14x14 tile into workgroup memory once.
 4. **present** (fragment): bilinear upscale, ACES tone map, tracers (closest-approach glow, depth tested against the
-   trace), crosshair, FPS counter (3x5 bitmap font, `Scene.fps`, 0 hides it), dither. Tracers and crosshair are drawn after tone mapping so they never enter history.
+   trace), crosshair, stats overlay (3x5 bitmap font: FPS, ray-traced resolution and its % of the output;
+   `Scene.fps`, 0 hides it), dither. **Raw mode** (`Renderer::set_raw`, key I) turns off every smoothing step:
+   nearest-neighbour upscale, no temporal accumulation, no spatial blur, no dither. Tracers and crosshair are drawn after tone mapping so they never enter history.
 
 Performance (M2, 1280x720, `shot --bench`): trace is most of the frame. Shadow rays used to walk a body's ~65
 spheres and cost ~70% of trace; spheres no longer cast shadows, which removed that (and brightens the scene, as
@@ -143,7 +146,7 @@ yaw fix, and real GPU performance of the tracer.
 cargo test                                  # sim tests
 cargo clippy --all-targets
 cargo run --release --bin swarmpf           # play
-cargo run --release --bin shot -- out 0.5   # writes out_walk/swarm/fire/aftermath/shotgun/gap/past_gap.png
+cargo run --release --bin shot -- out 0.5   # writes out_walk/walk_raw/swarm/fire/aftermath/shotgun/gap/past_gap.png
 cargo run --release --bin shot -- --bench   # GPU ms per pass, mean brightness (bias check), frame-to-frame noise
 cargo run --release -p sim --example bench  # physics us/tick and a position checksum (must not change on refactors)
 ```

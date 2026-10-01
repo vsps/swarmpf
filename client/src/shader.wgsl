@@ -14,7 +14,7 @@ struct Globals {
     dims: vec4<u32>,    // trace w, trace h, output w, output h
     counts: vec4<u32>,  // spheres, groups, boxes, tracers
     params: vec4<f32>,  // frame, exposure, hit_flash, unused
-    flags: vec4<u32>,   // x: target is sRGB
+    flags: vec4<u32>,   // x: target is sRGB, y: raw (no upscale filtering, accumulation, blur, dither)
 };
 
 struct Sphere {
@@ -439,7 +439,8 @@ fn temporal_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gp = gpos_r[idx];
     let gn = gnrm_r[idx];
     // Lights move every frame and misses carry no history; only static surfaces accumulate.
-    if (gn.w >= 0.0) {
+    // Raw mode keeps no history at all.
+    if (gn.w >= 0.0 || g.flags.y != 0u) {
         acc_out[idx] = vec4<f32>(cur.rgb, 1.0);
         return;
     }
@@ -478,6 +479,14 @@ fn spatial_main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
 ) {
+    // Raw mode: no blur. `g` is uniform, so this early return keeps the barrier below uniform.
+    if (g.flags.y != 0u) {
+        if (gid.x < g.dims.x && gid.y < g.dims.y) {
+            let i = gid.y * g.dims.x + gid.x;
+            fin_out[i] = acc_in[i];
+        }
+        return;
+    }
     let dim = vec2<i32>(g.dims.xy);
     let origin = vec2<i32>(wid.xy * 8u) - vec2<i32>(3);
     for (var k = lid.y * 8u + lid.x; k < TILE * TILE; k += 64u) {
@@ -550,50 +559,94 @@ fn fetch_fin(p: vec2<i32>) -> vec3<f32> {
     return fin_in[u32(c.y * dim.x + c.x)].rgb;
 }
 
-// "123 FPS" in the top-left corner, from a 3x5 bitmap font (bit 14 = top-left pixel), on a
-// darkened backdrop. `sc` scales with the output height.
-fn draw_fps(p: vec2<f32>, sc: f32, col: vec3<f32>) -> vec3<f32> {
-    // 0-9, then F and P; S reuses 5.
-    var font = array<u32, 12>(
-        31599u, 11415u, 29671u, 29647u, 23497u, 31183u, 31215u, 29257u, 31727u, 31695u, 31140u, 31716u,
+// Glyph code of the character at `i` of an unsigned number printed `width` wide, right aligned
+// (blank for leading positions) or left aligned.
+const BLANK: u32 = 99u;
+fn digit_at(v: u32, i: u32, width: u32, right: bool) -> u32 {
+    var nd = 1u;
+    var t = v / 10u;
+    while (t > 0u) {
+        nd += 1u;
+        t /= 10u;
+    }
+    var pos = 0u; // digit index from the left of the number
+    if (right) {
+        if (i + nd < width) {
+            return BLANK;
+        }
+        pos = i + nd - width;
+    } else {
+        if (i >= nd) {
+            return BLANK;
+        }
+        pos = i;
+    }
+    var p = 1u;
+    for (var k = 0u; k + 1u + pos < nd; k++) {
+        p *= 10u;
+    }
+    return (v / p) % 10u;
+}
+
+// Stats in the top-left corner, from a 3x5 bitmap font (bit 14 = top-left pixel), on a darkened
+// backdrop; `sc` scales with the output height.
+//   line 0: "123 FPS"
+//   line 1: "1280X720 100%"  ray-traced resolution and its share of the output width
+fn draw_stats(p: vec2<f32>, sc: f32, col: vec3<f32>) -> vec3<f32> {
+    // 0-9, F, P, X, %; S reuses 5.
+    var font = array<u32, 14>(
+        31599u, 11415u, 29671u, 29647u, 23497u, 31183u, 31215u, 29257u, 31727u, 31695u,
+        31140u, 31716u, 23213u, 21157u,
     );
     let px = 3.0 * sc;
     let cell = floor((p - vec2<f32>(10.0 * sc)) / px);
-    // Seven characters of four columns (three lit plus a gap), five rows, one cell of padding.
-    if (cell.x < -1.0 || cell.y < -1.0 || cell.x > 28.0 || cell.y > 5.0) {
+    // Up to 13 characters of four columns (three lit plus a gap); two lines of five rows with a
+    // one-row gap; one cell of padding all round.
+    let cols = 13.0 * 4.0 - 1.0;
+    if (cell.x < -1.0 || cell.y < -1.0 || cell.x > cols || cell.y > 11.0) {
         return col;
     }
     var out = col * 0.25;
-    if (cell.x < 0.0 || cell.y < 0.0 || cell.y > 4.0 || cell.x > 27.0) {
+    if (cell.x < 0.0 || cell.y < 0.0 || cell.x >= cols || cell.y == 5.0 || cell.y > 10.0) {
         return out;
     }
+    let line = u32(cell.y) / 6u;
+    let row = u32(cell.y) % 6u;
     let ch = u32(cell.x) / 4u;
     let cx = u32(cell.x) % 4u;
-    if (cx == 3u || ch == 3u) {
+    if (cx == 3u) {
         return out;
     }
-    let fps = min(u32(round(g.params.w)), 999u);
-    var glyph = 0u;
-    if (ch == 0u) {
-        if (fps < 100u) {
-            return out;
+    var glyph = BLANK;
+    if (line == 0u) {
+        let fps = min(u32(round(g.params.w)), 999u);
+        if (ch < 3u) {
+            glyph = digit_at(fps, ch, 3u, true);
+        } else if (ch == 4u) {
+            glyph = 10u;
+        } else if (ch == 5u) {
+            glyph = 11u;
+        } else if (ch == 6u) {
+            glyph = 5u;
         }
-        glyph = fps / 100u;
-    } else if (ch == 1u) {
-        if (fps < 10u) {
-            return out;
-        }
-        glyph = (fps / 10u) % 10u;
-    } else if (ch == 2u) {
-        glyph = fps % 10u;
-    } else if (ch == 4u) {
-        glyph = 10u;
-    } else if (ch == 5u) {
-        glyph = 11u;
     } else {
-        glyph = 5u;
+        let pct = u32(round(100.0 * f32(g.dims.x) / f32(g.dims.z)));
+        if (ch < 4u) {
+            glyph = digit_at(min(g.dims.x, 9999u), ch, 4u, true);
+        } else if (ch == 4u) {
+            glyph = 12u;
+        } else if (ch < 9u) {
+            glyph = digit_at(min(g.dims.y, 9999u), ch - 5u, 4u, false);
+        } else if (ch < 12u) {
+            glyph = digit_at(pct, ch - 9u, 3u, true);
+        } else if (ch == 12u) {
+            glyph = 13u;
+        }
     }
-    let bit = 14u - (u32(cell.y) * 3u + cx);
+    if (glyph == BLANK) {
+        return out;
+    }
+    let bit = 14u - (row * 3u + cx);
     if (((font[glyph] >> bit) & 1u) == 1u) {
         out = vec3<f32>(1.0);
     }
@@ -606,16 +659,21 @@ fn fs_present(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     let uv = fc.xy / out_size;
     let tsize = vec2<f32>(g.dims.xy);
 
-    // Bilinear upscale of the traced image.
-    let tp = uv * tsize - 0.5;
-    let base = floor(tp);
-    let f = tp - base;
-    let bi = vec2<i32>(base);
-    let c00 = fetch_fin(bi);
-    let c10 = fetch_fin(bi + vec2<i32>(1, 0));
-    let c01 = fetch_fin(bi + vec2<i32>(0, 1));
-    let c11 = fetch_fin(bi + vec2<i32>(1, 1));
-    var col = mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y) * g.params.y;
+    // Bilinear upscale of the traced image (nearest pixel in raw mode).
+    var col: vec3<f32>;
+    if (g.flags.y != 0u) {
+        col = fetch_fin(vec2<i32>(floor(uv * tsize))) * g.params.y;
+    } else {
+        let tp = uv * tsize - 0.5;
+        let base = floor(tp);
+        let f = tp - base;
+        let bi = vec2<i32>(base);
+        let c00 = fetch_fin(bi);
+        let c10 = fetch_fin(bi + vec2<i32>(1, 0));
+        let c01 = fetch_fin(bi + vec2<i32>(0, 1));
+        let c11 = fetch_fin(bi + vec2<i32>(1, 1));
+        col = mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y) * g.params.y;
+    }
     col = aces(col);
 
     // Tracers: glowing segments, depth-tested against the traced scene, drawn over the tonemapped image.
@@ -661,12 +719,14 @@ fn fs_present(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     if (g.params.w > 0.0) {
-        col = draw_fps(fc.xy, sc, col);
+        col = draw_stats(fc.xy, sc, col);
     }
 
-    // Tiny dither hides banding in the dark gradients.
-    let n = f32(pcg(u32(fc.x) + u32(fc.y) * 8192u)) * (1.0 / 4294967296.0) - 0.5;
-    col += vec3<f32>(n / 255.0);
+    // Tiny dither hides banding in the dark gradients (off in raw mode).
+    if (g.flags.y == 0u) {
+        let n = f32(pcg(u32(fc.x) + u32(fc.y) * 8192u)) * (1.0 / 4294967296.0) - 0.5;
+        col += vec3<f32>(n / 255.0);
+    }
     if (g.flags.x == 0u) {
         col = pow(max(col, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     }
