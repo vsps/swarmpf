@@ -77,7 +77,7 @@ Passes (all in `shader.wgsl`):
 
 1. **trace** (compute): primary ray per pixel at `TRACE_SCALE` (default 0.5) of window size. Surfaces get direct
    light from sphere emitters via weighted reservoir sampling (two picks, shadow ray to a random point on the
-   light's disc) plus one cosine-sampled bounce with the same direct-light estimator at the bounce point. Light
+   light's disc; only boxes cast shadows, spheres are lights and never occlude) plus one cosine-sampled bounce with the same direct-light estimator at the bounce point. Light
    selection is hybrid (`direct_light`): a player within `NEAR_K` bounding radii enters sphere by sphere with the
    exact weight `lum * r^2 * cos / d^2`; a farther player enters as one entry (power from its centre) and, if
    picked, a sphere is chosen by RIS (`RIS_M` candidates from the per-player power CDF built in
@@ -89,9 +89,10 @@ Passes (all in `shader.wgsl`):
 4. **present** (fragment): bilinear upscale, ACES tone map, tracers (closest-approach glow, depth tested against the
    trace), crosshair, FPS counter (3x5 bitmap font, `Scene.fps`, 0 hides it), dither. Tracers and crosshair are drawn after tone mapping so they never enter history.
 
-Performance (M2, 1280x720, `shot --bench`): trace is ~85% of the frame, and most of it is shadow rays walking a
-body's ~65 spheres (half the light is blocked by the body's own outer shell). Tried without gain: per-player
-sphere clusters (2-level BVH), loading only `pos_r`, largest-first sphere order, a single `direct_light` call site.
+Performance (M2, 1280x720, `shot --bench`): trace is most of the frame. Shadow rays used to walk a body's ~65
+spheres and cost ~70% of trace; spheres no longer cast shadows, which removed that (and brightens the scene, as
+bodies no longer block their own light). Tried without gain before that: per-player sphere clusters (2-level
+BVH), loading only `pos_r`, largest-first sphere order, a single `direct_light` call site.
 On Apple GPUs the present pass's timestamps overlap the compute passes; trust the wall-clock ms/frame.
 
 There is no sky, ambient or fill light. Floor and ceiling boxes exist purely so light has something to bounce off.
@@ -108,8 +109,8 @@ yaw fix, and real GPU performance of the tracer.
 ## Next steps
 
 1. **Play-test on a GPU.** Frame rate at scale 0.5 and 1.0; mouse feel; is the darkness right; is the noise
-   acceptable. If slow: shadow rays against body spheres dominate; options that change the look are fewer
-   reservoir picks, no shadow ray at the bounce, or a lower default trace scale.
+   acceptable. If slow: options that change the look are fewer reservoir picks, no shadow ray at the bounce,
+   or a lower default trace scale.
 2. **Lag-compensation history** for hitscan (about 250 ms of element positions) in `sim`.
 3. **Networking (on hold, by request).** `server/` authoritative at 60 Hz, snapshots 20-30 Hz over UDP
    (`renet` or `quinn` datagrams), client prediction for the local body, interpolation for others.

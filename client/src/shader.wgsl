@@ -182,29 +182,14 @@ fn trace(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> Hit {
     return h;
 }
 
-fn occluded(o: vec3<f32>, d: vec3<f32>, tmax: f32, ignore: u32) -> bool {
+// Shadow test against the level only: spheres are lights, not occluders, so they cast no
+// shadows (and a shadow ray never has to walk a body's spheres, which was most of the cost).
+fn occluded(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> bool {
     let inv = inv_dir(d);
     for (var i = 0u; i < g.counts.z; i++) {
         let r = ray_box(o, inv, boxes[i].bmin.xyz, boxes[i].bmax.xyz);
         if (r.x > 1.0e-4 && r.x < tmax) {
             return true;
-        }
-    }
-    for (var gi = 0u; gi < g.counts.y; gi++) {
-        let gr = groups[gi];
-        if (!hits_bound(o, d, gr.bound, tmax)) {
-            continue;
-        }
-        for (var k = 0u; k < gr.range.y; k++) {
-            let si = gr.range.x + k;
-            if (si == ignore) {
-                continue;
-            }
-            let pr = spheres[si].pos_r;
-            let t = ray_sphere_t(o, d, pr.xyz, pr.w);
-            if (t > 1.0e-4 && t < tmax) {
-                return true;
-            }
         }
     }
     return false;
@@ -223,7 +208,7 @@ fn occluded(o: vec3<f32>, d: vec3<f32>, tmax: f32, ignore: u32) -> bool {
 //    proportion to its real cos / d^2 term. From afar a body's spheres all look alike, so this
 //    is nearly as good as the exact loop at a fraction of the cost.
 // Two independent picks, a shadow ray each to a random point on the light's disc. `ignore` is a
-// sphere index that must not light or block itself.
+// sphere index that must not light itself.
 const NEAR_K: f32 = 2.5;
 // Picks with this bit set name a whole group (far player) rather than a sphere.
 const GROUP_BIT: u32 = 0x80000000u;
@@ -355,7 +340,7 @@ fn direct_light(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, ignore: u32) -> v
         let dir_full = target_p - o;
         let dl = length(dir_full);
         let dir = dir_full / dl;
-        if (dot(dir, n) <= 0.0 || occluded(o, dir, dl - s.pos_r.w * 0.9, chosen)) {
+        if (dot(dir, n) <= 0.0 || occluded(o, dir, dl - s.pos_r.w * 0.9)) {
             continue;
         }
         let le = s.emit.rgb;
