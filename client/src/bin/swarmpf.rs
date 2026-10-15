@@ -2,9 +2,10 @@
 //! WASD move, mouse look, Shift hold = disperse, LMB fire (rifle is automatic),
 //! 1/2/3 rifle / shotgun / railgun, V first/third person,
 //! [ and ] lower / raise the ray-trace resolution, , and . fewer / more lighting samples per pixel
-//! (1, 2, 4, 8, 16), I toggle raw pixels (nearest upscale, no blur or dither), T toggle temporal
-//! accumulation. Esc releases the mouse and opens the settings panel (click its buttons); Esc
-//! again resumes. FPS, ray-traced resolution and samples per pixel show top left.
+//! (1, 2, 4, 8, 16), Y and U shorter / longer temporal history, I toggle raw pixels (nearest upscale,
+//! no blur or dither), T toggle temporal accumulation. Esc releases the mouse and opens the settings
+//! panel (click its buttons); Esc again resumes. FPS, ray-traced resolution and samples per pixel
+//! show top left.
 
 use client::game::Game;
 use client::renderer::Renderer;
@@ -13,6 +14,7 @@ use sim::player::Input;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -20,6 +22,9 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 /// Fraction of the window resolution that is ray traced. Lower it if the frame rate is poor.
 const TRACE_SCALE: f32 = 0.5;
+
+/// Window size in physical pixels (1080p).
+const WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize::new(1920, 1080);
 
 struct Gfx {
     window: Arc<Window>,
@@ -74,6 +79,7 @@ impl App {
             trace: r.trace_size(),
             output: r.output_size(),
             spp: r.spp(),
+            history: r.history(),
             raw: r.raw(),
             temporal: r.temporal(),
         }
@@ -92,6 +98,8 @@ impl App {
             Action::SppUp => r.set_spp(r.spp() * 2),
             Action::ScaleDown => r.set_scale(r.scale() - 0.125),
             Action::ScaleUp => r.set_scale(r.scale() + 0.125),
+            Action::HistoryDown => r.set_history((r.history() / 2).max(1)),
+            Action::HistoryUp => r.set_history(r.history() * 2),
             Action::ToggleRaw => r.set_raw(!r.raw()),
             Action::ToggleTemporal => r.set_temporal(!r.temporal()),
             Action::Resume => {}
@@ -117,8 +125,12 @@ impl ApplicationHandler for App {
             return;
         }
         let window = Arc::new(
-            el.create_window(Window::default_attributes().with_title("swarmpf"))
-                .expect("window"),
+            el.create_window(
+                Window::default_attributes()
+                    .with_title("swarmpf")
+                    .with_inner_size(WINDOW_SIZE),
+            )
+            .expect("window"),
         );
         let surface = self
             .instance
@@ -147,6 +159,14 @@ impl ApplicationHandler for App {
             config.width,
             config.height,
             TRACE_SCALE,
+        );
+        // This binary has not been run on real hardware yet: say what the window actually got.
+        let (tw, th) = renderer.trace_size();
+        eprintln!(
+            "window {}x{} trace {tw}x{th} on {}",
+            config.width,
+            config.height,
+            adapter.get_info().name
         );
         self.gfx = Some(Gfx {
             window,
@@ -220,6 +240,8 @@ impl ApplicationHandler for App {
                         KeyCode::Period if down => self.apply(Action::SppUp),
                         KeyCode::KeyI if down => self.apply(Action::ToggleRaw),
                         KeyCode::KeyT if down => self.apply(Action::ToggleTemporal),
+                        KeyCode::KeyY if down => self.apply(Action::HistoryDown),
+                        KeyCode::KeyU if down => self.apply(Action::HistoryUp),
                         KeyCode::Digit1 if down => self.game.cycle_weapon(0),
                         KeyCode::Digit2 if down => self.game.cycle_weapon(1),
                         KeyCode::Digit3 if down => self.game.cycle_weapon(2),

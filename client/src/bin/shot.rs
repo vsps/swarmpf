@@ -67,6 +67,7 @@ fn main() {
             trace: renderer.trace_size(),
             output: renderer.output_size(),
             spp: renderer.spp(),
+            history: renderer.history(),
             raw: renderer.raw(),
             temporal: renderer.temporal(),
         };

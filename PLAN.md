@@ -73,6 +73,8 @@ client/   wgpu renderer + local game
 - Yaw 0 faces +Z; yaw increases toward +X, which is the player's LEFT. So mouse-right decreases yaw.
 - Body space is +Y up, +Z forward, +X left ("L" joints/slots are +X). `Input.strafe > 0` means right.
 - Fixed tick 60 Hz (`sim::DT`). The client accumulates real time and ticks the sim.
+- The interactive window opens at 1920x1080 physical pixels (`WINDOW_SIZE` in `swarmpf.rs`), ray traced at
+  `TRACE_SCALE` (0.5) of that = 960x540. `shot` renders at 1280x720 so its numbers stay comparable.
 - Rifle is automatic (hold LMB); pellet and railgun fire once per click (`WEAPONS` auto flag, `Game::trigger`).
 - Third-person camera is a sphere (`CAM_RADIUS`) that collides with the level and chases a goal behind the player
   (`CAM_LAG_*`, pulled back `CAM_BACK_SWARM` while dispersed). If a wall hides the goal it retraces the core's
@@ -93,7 +95,8 @@ Passes (all in `shader.wgsl`):
    picked, a sphere is chosen by RIS (`RIS_M` candidates from the per-player power CDF built in
    `renderer.rs::build_accel`). Unbiased, same noise as the plain per-light loop, ~30% cheaper. Spheres are flat shaded: one colour each, compressed emission (`EMITTER_DISPLAY`).
 2. **temporal** (compute): reproject static surfaces with the previous view-proj, validate by id / normal / depth,
-   blend with history count capped at 6 (lights move every frame, so long history smears).
+   blend with history count capped at `Renderer::history()` (the HISTORY setting, 6 frames by default: lights
+   move every frame, so long history smears).
 3. **spatial** (compute): 7x7 bilateral on normals and plane distance, static surfaces only; each 8x8 workgroup
    loads its 14x14 tile into workgroup memory once.
 4. **present** (fragment): bilinear upscale, ACES tone map, tracers (closest-approach glow, depth tested against the
@@ -103,12 +106,17 @@ Passes (all in `shader.wgsl`):
 5. **ui** (instanced quads, alpha blended, same render pass): HUD and settings panel from `ui.rs`, a 3x5 pixel
    font (A-Z, 0-9, symbols) laid out on the CPU in output pixels. HUD (top left): FPS, ray-traced resolution and
    its % of the output, samples per pixel, which smoothing is off. Esc releases the mouse and shows the settings
-   panel (samples and resolution -/+, raw and temporal on/off, resume); Esc again resumes.
+   panel (samples, resolution, raw pixels, temporal smoothing and its history span -/+, resume); Esc again resumes.
 
 Display options (keys, or the settings panel):
 - **Raw pixels** (`Renderer::set_raw`, I): nearest-neighbour upscale, no spatial blur, no dither.
 - **Temporal accumulation** (`Renderer::set_temporal`, T, on by default): per-pixel reprojected history. Raw +
   temporal gives accumulated, unblurred pixels; both off is the bare trace.
+- **Temporal history** (`Renderer::set_history`, Y and U, 1-32 frames, 6 by default): how many frames of history
+  the temporal pass blends, so how far back in time a pixel is sampled. 6 frames is ~100 ms at 60 Hz; longer is
+  quieter but smears (the lights move every frame and history is only invalidated by geometry changes), 1 frame
+  is no accumulation at all. Measured on the walk scene (raw walk, 640x360, spatial filter on): frame-to-frame
+  noise 0.030 at 1 frame, 0.0038 at 6, 0.0014 at 32.
 - **Samples per pixel** (`Renderer::set_spp`, , and ., 1-16): the lighting (light picks, shadow rays, bounce) is
   averaged over N samples of the same pixel-centre hit, so no AA is added. Raw walk scene at 0.5: 1 spp 5.6 ms,
   noise 0.097; 8 spp 34.7 ms, noise 0.058 (`shot --bench quick`). A per-sample firefly clamp made no difference:
@@ -130,8 +138,8 @@ Tuning knobs: `EMIT` / `CORE_EMIT` in `game.rs`, `exposure` in the scene, `EMITT
 Done and tested (18 sim tests): sphere swarm, hp model, core, hitscan with penetration and wall blocking, humanoid rig
 and walk cycle, boid dispersal, gap filtering and no re-forming inside walls, debris.
 Done and checked only through headless screenshots: ray tracer, third-person camera, tracers, crosshair, hit flash.
-**Not yet run on real hardware**: the interactive window (mouse grab, vsync, resize, `[` / `]` scale keys), the mouse
-yaw fix, and real GPU performance of the tracer.
+**Started once on real hardware** (RTX A5000, Windows): the window opens at 1920x1080 with a 960x540 trace and
+renders without panicking. Mouse feel, vsync, resize and the `[` / `]` scale keys still need a play session.
 
 ## Next steps
 

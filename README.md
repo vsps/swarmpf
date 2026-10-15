@@ -19,9 +19,11 @@ Multiplayer FPS where each player is a cloud of spheres.
   only light in the scene: surfaces get direct light from importance-sampled emitters with shadow rays plus one
   diffuse bounce, then temporal and edge-aware spatial denoising. Tracers and the crosshair are drawn over the
   tone-mapped image so they do not smear. Two binaries:
-  - `swarmpf`: interactive window, third-person over-the-shoulder camera. WASD move, mouse look, hold Shift to
-    disperse, hold LMB to fire, 1/2/3 weapon, V toggles first person, `[` / `]` lower / raise the ray-trace
-    resolution (default half), Esc releases the mouse.
+  - `swarmpf`: interactive window at 1080p, third-person over-the-shoulder camera. WASD move, mouse look, hold
+    Shift to disperse, hold LMB to fire, 1/2/3 weapon, V toggles first person, `[` / `]` lower / raise the
+    ray-trace resolution (default half), Esc releases the mouse and shows the settings panel (samples,
+    resolution, raw pixels, temporal smoothing on/off and its history span, `,` / `.` and Y / U do the same
+    from the keyboard).
   - `shot <prefix> [trace_scale]`: headless scripted scenario that writes PNGs (works on software Vulkan, e.g.
     llvmpipe).
 

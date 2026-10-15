@@ -16,7 +16,8 @@ struct Globals {
     params: vec4<f32>,  // frame, exposure, hit_flash, reload progress (< 0: none)
     flags: vec4<u32>,   // x: target is sRGB, y: raw (nearest upscale, no blur, no dither),
                         // z: lighting samples per pixel, w: temporal accumulation on
-    counts2: vec4<u32>, // x: box chunks
+    // x: box chunks, y: frames of history the temporal pass blends (its time span).
+    counts2: vec4<u32>,
 };
 
 struct Sphere {
@@ -509,8 +510,9 @@ fn temporal_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let expect = length(gp.xyz - g.prev_eye.xyz);
             if (pn.w == gn.w && dot(pn.xyz, gn.xyz) > 0.9 && abs(pt - expect) < 0.05 * expect + 0.02) {
                 let hist = acc_prev[pi];
-                // Short history: every light moves, so long accumulation would smear.
-                let count = min(hist.w + 1.0, 6.0);
+                // Short history: every light moves, so long accumulation would smear. The cap
+                // (g.counts2.y, the HISTORY setting) is how much of the past each frame mixes in.
+                let count = min(hist.w + 1.0, max(f32(g.counts2.y), 1.0));
                 out = vec4<f32>(mix(hist.rgb, cur.rgb, 1.0 / count), count);
             }
         }

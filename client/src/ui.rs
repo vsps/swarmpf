@@ -78,6 +78,9 @@ pub enum Action {
     SppUp,
     ScaleDown,
     ScaleUp,
+    /// Shorter / longer temporal history (the time span the smoothing samples).
+    HistoryDown,
+    HistoryUp,
     ToggleRaw,
     ToggleTemporal,
     Resume,
@@ -89,6 +92,8 @@ pub struct Status {
     pub trace: (u32, u32),
     pub output: (u32, u32),
     pub spp: u32,
+    /// Frames of history the temporal pass blends.
+    pub history: u32,
     pub raw: bool,
     pub temporal: bool,
 }
@@ -217,7 +222,7 @@ pub fn settings(ui: &mut Ui, s: &Status, cursor: Option<(f32, f32)>) {
     let label_w = text_width("RESOLUTION", px) + 8.0 * px;
     let value_w = text_width("100%", px) + 4.0 * px;
     let w = label_w + 2.0 * (text_width("-", px) + 4.0 * px) + value_w + 6.0 * px + 8.0 * px;
-    let h = 6.0 * row + 6.0 * px;
+    let h = 7.0 * row + 6.0 * px;
     let x0 = ((s.output.0 as f32 - w) * 0.5).round();
     let y0 = ((s.output.1 as f32 - h) * 0.5).round();
     ui.rect([x0, y0, w, h], [0.04, 0.05, 0.07, 0.85]);
@@ -267,6 +272,16 @@ pub fn settings(ui: &mut Ui, s: &Status, cursor: Option<(f32, f32)>) {
         on_off(s.temporal),
         Action::ToggleTemporal,
         cursor,
+    );
+    y += row;
+    // How far back in time the temporal pass averages: 1 frame is no smoothing at all.
+    stepper(
+        ui,
+        y,
+        "HISTORY",
+        format!("{} F", s.history),
+        Action::HistoryDown,
+        Action::HistoryUp,
     );
     y += row;
     ui.button(x, y, px, "RESUME", Action::Resume, cursor);

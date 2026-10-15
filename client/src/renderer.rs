@@ -164,7 +164,7 @@ struct Globals {
     counts: [u32; 4],
     params: [f32; 4],
     flags: [u32; 4],
-    /// x: box chunk count.
+    /// x: box chunk count, y: frames of history the temporal pass blends.
     counts2: [u32; 4],
 }
 
@@ -215,6 +215,13 @@ struct Timing {
 
 pub const MAX_SPP: u32 = 16;
 
+/// Longest temporal history (in frames) the settings allow. A light moves every frame, so a long
+/// history is quieter but smears more; 32 frames is half a second at 60 Hz.
+pub const MAX_HISTORY: u32 = 32;
+
+/// Frames of history blended by default (about 100 ms at 60 Hz).
+const DEFAULT_HISTORY: u32 = 6;
+
 /// Names of the timed passes, in the order `Renderer::timings` reports them.
 pub const PASSES: [&str; 4] = ["trace", "temporal", "spatial", "present"];
 
@@ -226,6 +233,9 @@ pub struct Renderer {
     accumulate: bool,
     /// Lighting samples per pixel (`MAX_SPP` at most).
     spp: u32,
+    /// Frames of history the temporal filter blends: how far back in time it samples (`MAX_HISTORY`
+    /// at most, 1 = no accumulation).
+    history: u32,
     /// Cached per frame parity; cleared when a buffer they point at is replaced.
     bind_groups: [Option<[wgpu::BindGroup; 5]>; 2],
     device: wgpu::Device,
@@ -529,6 +539,7 @@ impl Renderer {
             raw: false,
             accumulate: true,
             spp: 1,
+            history: DEFAULT_HISTORY,
             bind_groups: [None, None],
             device,
             queue,
@@ -652,6 +663,17 @@ impl Renderer {
 
     pub fn spp(&self) -> u32 {
         self.spp
+    }
+
+    /// How many frames of history the temporal filter blends: the span of time it samples.
+    /// Longer is quieter but smears moving lights. No history reset is needed - each pixel's
+    /// stored count converges on the new cap by itself.
+    pub fn set_history(&mut self, frames: u32) {
+        self.history = frames.clamp(1, MAX_HISTORY);
+    }
+
+    pub fn history(&self) -> u32 {
+        self.history
     }
 
     fn rebuild_frame(&mut self) {
@@ -789,7 +811,7 @@ impl Renderer {
                 self.spp,
                 self.accumulate as u32,
             ],
-            counts2: [chunks.len() as u32, 0, 0, 0],
+            counts2: [chunks.len() as u32, self.history, 0, 0],
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
